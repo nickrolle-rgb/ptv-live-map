@@ -31,6 +31,8 @@ const MODES = {
 const map = L.map('app').setView([-37.8136, 144.9631], 13);
 let tileLayer = L.tileLayer(TILES.light, { attribution: ATTRIBUTION }).addTo(map);
 
+new ResizeObserver(() => map.invalidateSize()).observe(document.getElementById('app'));
+
 let currentlyDark = false;
 function setDarkMode(dark) {
   currentlyDark = dark;
