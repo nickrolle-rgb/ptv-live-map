@@ -10,6 +10,9 @@ import vlineShapes from './data/vline-shapes.json';
 import trainStops from './data/train-stops.json';
 import tramStops from './data/tram-stops.json';
 import vlineStops from './data/vline-stops.json';
+import trainStopNames from './data/train-stop-names.json';
+import tramStopNames from './data/tram-stop-names.json';
+import vlineStopNames from './data/vline-stop-names.json';
 
 const TILES = {
   light: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
@@ -23,9 +26,9 @@ const STATIONARY_AFTER_MS = 25000;
 const TICK_LENGTH_M = 18;
 
 const MODES = {
-  tram: { label: 'Trams', color: '#6b46c1', names: tramRouteNames, hasAlerts: true, shapes: tramShapes, stops: tramStops },
-  train: { label: 'Trains', color: '#1d4ed8', names: trainRouteNames, hasAlerts: true, shapes: trainShapes, stops: trainStops },
-  vline: { label: 'V/Line', color: '#8F1A95', names: vlineRouteNames, hasAlerts: false, shapes: vlineShapes, stops: vlineStops },
+  tram: { label: 'Trams', color: '#6b46c1', names: tramRouteNames, hasAlerts: true, shapes: tramShapes, stops: tramStops, stopNames: tramStopNames },
+  train: { label: 'Trains', color: '#1d4ed8', names: trainRouteNames, hasAlerts: true, shapes: trainShapes, stops: trainStops, stopNames: trainStopNames },
+  vline: { label: 'V/Line', color: '#8F1A95', names: vlineRouteNames, hasAlerts: false, shapes: vlineShapes, stops: vlineStops, stopNames: vlineStopNames },
 };
 
 const map = L.map('app').setView([-37.8136, 144.9631], 13);
@@ -50,6 +53,7 @@ darkQuery.addEventListener('change', (e) => {
 const markers = new Map();
 let allVehicles = [];
 let alertsByRoute = new Map();
+let tripUpdatesByTrip = new Map();
 let userLocation = null;
 let userLocationMarker = null;
 const selectedRoutes = new Set();
@@ -169,10 +173,50 @@ const OCCUPANCY_LABELS = {
 function occupancyLabel(status) {
   return status === null || status === undefined ? null : OCCUPANCY_LABELS[status] ?? null;
 }
+
+function stopName(mode, stopId) {
+  if (!stopId) return null;
+  return MODES[mode]?.stopNames?.[stopId] ?? null;
+}
+
+function formatEtaMinutes(unixSeconds) {
+  const diffMs = unixSeconds * 1000 - Date.now();
+  const mins = Math.round(diffMs / 60000);
+  return mins <= 0 ? 'due' : `${mins} min`;
+}
+
+function nextStopInfo(mode, tripId) {
+  if (!tripId) return null;
+  const update = tripUpdatesByTrip.get(`${mode}:${tripId}`);
+  if (!update) return null;
+  const name = stopName(mode, update.stopId);
+  if (!name) return null;
+
+  const now = Date.now() / 1000;
+  const { arrival, departure } = update;
+  const atStop = arrival != null && arrival <= now;
+
+  if (atStop) {
+    return departure == null
+      ? { label: 'At', name, eta: null }
+      : { label: 'At', name, eta: formatEtaMinutes(departure), etaVerb: 'departing' };
+  }
+  const etaSeconds = departure ?? arrival;
+  return etaSeconds == null
+    ? { label: 'Next stop', name, eta: null }
+    : { label: 'Next stop', name, eta: formatEtaMinutes(etaSeconds), etaVerb: null };
+}
+
 function buildPopupContent(v, info, bearing, moving) {
   const parts = [`<strong>${MODES[v.mode]?.label ?? v.mode} route ${info.name}</strong>`, `Vehicle: ${v.id}`];
   if (moving) parts.push(`Heading: ${bearingToCompass(bearing)}`);
   else parts.push('Status: stationary');
+  const next = nextStopInfo(v.mode, v.tripId);
+  if (next) {
+    if (next.eta == null) parts.push(`${next.label}: ${next.name}`);
+    else if (next.etaVerb) parts.push(`${next.label}: ${next.name} (${next.etaVerb} ${next.eta})`);
+    else parts.push(`${next.label}: ${next.name} (${next.eta})`);
+  }
   const occupancy = occupancyLabel(v.occupancyStatus);
   if (occupancy) parts.push(`Crowding: ${occupancy}`);
   return parts.join('<br>');
@@ -295,6 +339,17 @@ async function refreshData() {
     });
   });
   alertsByRoute = newAlerts;
+
+  const tripUpdateResults = await Promise.all(
+    modeKeys.map((mode) => fetchJson(`/api/trip-updates?mode=${mode}`))
+  );
+  const newTripUpdates = new Map();
+  modeKeys.forEach((mode, i) => {
+    Object.entries(tripUpdateResults[i]).forEach(([tripId, update]) => {
+      newTripUpdates.set(`${mode}:${tripId}`, update);
+    });
+  });
+  tripUpdatesByTrip = newTripUpdates;
 
   renderMarkers();
   updateRouteStatuses();

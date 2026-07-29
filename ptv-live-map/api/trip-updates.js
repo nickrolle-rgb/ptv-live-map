@@ -2,9 +2,9 @@ import https from 'node:https';
 import GtfsRealtimeBindings from 'gtfs-realtime-bindings';
 
 const FEEDS = {
-  tram: 'https://api.opendata.transport.vic.gov.au/opendata/public-transport/gtfs/realtime/v1/tram/vehicle-positions',
-  train: 'https://api.opendata.transport.vic.gov.au/opendata/public-transport/gtfs/realtime/v1/metro/vehicle-positions',
-  vline: 'https://api.opendata.transport.vic.gov.au/opendata/public-transport/gtfs/realtime/v1/vline/vehicle-positions',
+  tram: 'https://api.opendata.transport.vic.gov.au/opendata/public-transport/gtfs/realtime/v1/tram/trip-updates',
+  train: 'https://api.opendata.transport.vic.gov.au/opendata/public-transport/gtfs/realtime/v1/metro/trip-updates',
+  vline: 'https://api.opendata.transport.vic.gov.au/opendata/public-transport/gtfs/realtime/v1/vline/trip-updates',
 };
 
 function fetchBuffer(url, headers) {
@@ -29,28 +29,23 @@ export default async function handler(req, res) {
     const buffer = await fetchBuffer(FEEDS[mode], { KeyID: process.env.GTFS_API_KEY });
     const feed = GtfsRealtimeBindings.transit_realtime.FeedMessage.decode(new Uint8Array(buffer));
 
-    const vehicles = feed.entity
-      .filter((entity) => entity.vehicle)
-      .map((entity) => {
-        const v = entity.vehicle;
-        return {
-          id: entity.id,
-          routeId: v.trip?.routeId ?? null,
-          tripId: v.trip?.tripId ?? null,
-          lat: v.position?.latitude,
-          lon: v.position?.longitude,
-          bearing: v.position?.bearing ?? null,
-          speed: v.position?.speed ?? null,
-          occupancyStatus: v.occupancyStatus ?? null,
-          stopId: v.stopId ?? null,
-          currentStatus: v.currentStatus ?? null,
-        };
-      });
+    const updates = {};
+    feed.entity.forEach((entity) => {
+      const tu = entity.tripUpdate;
+      const tripId = tu?.trip?.tripId;
+      const stu = tu?.stopTimeUpdate?.[0];
+      if (!tripId || !stu) return;
+      updates[tripId] = {
+        stopId: stu.stopId ?? null,
+        arrival: stu.arrival?.time != null ? Number(stu.arrival.time) : null,
+        departure: stu.departure?.time != null ? Number(stu.departure.time) : null,
+      };
+    });
 
     res.setHeader('Cache-Control', 's-maxage=20, stale-while-revalidate=30');
-    res.status(200).json(vehicles);
+    res.status(200).json(updates);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Failed to fetch vehicle positions' });
+    res.status(500).json({ error: 'Failed to fetch trip updates' });
   }
 }
