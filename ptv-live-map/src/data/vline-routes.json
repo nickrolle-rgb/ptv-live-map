@@ -1,54 +1,67 @@
 {
   "aus:vic:vic-01-ABY:": {
     "name": "Albury via Seymour",
-    "color": "#8F1A95"
+    "color": "#8F1A95",
+    "group": "Seymour"
   },
   "aus:vic:vic-01-ART:": {
     "name": "Ararat via Ballarat",
-    "color": "#8F1A95"
+    "color": "#8F1A95",
+    "group": "Ballarat"
   },
   "aus:vic:vic-01-BAT:": {
     "name": "Ballarat via Melton",
-    "color": "#8F1A95"
+    "color": "#8F1A95",
+    "group": "Ballarat"
   },
   "aus:vic:vic-01-BDE:": {
     "name": "Bairnsdale via Traralgon & Sale",
-    "color": "#8F1A95"
+    "color": "#8F1A95",
+    "group": "Traralgon"
   },
   "aus:vic:vic-01-BGO:": {
     "name": "Bendigo via Sunbury",
-    "color": "#8F1A95"
+    "color": "#8F1A95",
+    "group": "Bendigo"
   },
   "aus:vic:vic-01-ECH:": {
     "name": "Echuca/Moama via Bendigo or Heathcote",
-    "color": "#8F1A95"
+    "color": "#8F1A95",
+    "group": "Bendigo"
   },
   "aus:vic:vic-01-GEL:": {
     "name": "Geelong",
-    "color": "#8F1A95"
+    "color": "#8F1A95",
+    "group": "Geelong"
   },
   "aus:vic:vic-01-MBY:": {
     "name": "Maryborough via Ballarat",
-    "color": "#8F1A95"
+    "color": "#8F1A95",
+    "group": "Ballarat"
   },
   "aus:vic:vic-01-SER:": {
     "name": "Seymour via Broadmeadows",
-    "color": "#8F1A95"
+    "color": "#8F1A95",
+    "group": "Seymour"
   },
   "aus:vic:vic-01-SNH:": {
     "name": "Shepparton via Seymour",
-    "color": "#8F1A95"
+    "color": "#8F1A95",
+    "group": "Seymour"
   },
   "aus:vic:vic-01-SWL:": {
     "name": "Swan Hill via Bendigo",
-    "color": "#8F1A95"
+    "color": "#8F1A95",
+    "group": "Bendigo"
   },
   "aus:vic:vic-01-TRN:": {
     "name": "Traralgon via Pakenham, Moe & Morwell",
-    "color": "#8F1A95"
+    "color": "#8F1A95",
+    "group": "Traralgon"
   },
   "aus:vic:vic-01-WBL:": {
     "name": "Warrnambool via Geelong & Colac",
-    "color": "#8F1A95"
+    "color": "#8F1A95",
+    "group": "Geelong"
   }
 }

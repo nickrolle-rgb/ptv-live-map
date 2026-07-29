@@ -60,7 +60,8 @@ for (const line of lines.slice(1)) {
       ? formatLongName(longName)
       : shortName || longName;
 
-  lookup[routeId] = { name, color };
+  const group = nameField === 'long' ? (shortName || name) : color;
+  lookup[routeId] = { name, color, group };
 }
 
 fs.mkdirSync('./src/data', { recursive: true });

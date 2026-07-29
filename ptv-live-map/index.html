@@ -9,8 +9,15 @@
   <body>
 <div id="controls">
   <div id="route-picker">
-    <button id="route-picker-toggle" type="button">All vehicles (near me) ▾</button>
-    <div id="route-picker-panel" hidden>
+    <button id="route-picker-toggle" type="button">
+      <span id="route-picker-toggle-label">All vehicles (near me)</span>
+      <span id="route-picker-chevron" aria-hidden="true">&#9662;</span>
+    </button>
+    <div id="route-picker-panel">
+      <div id="route-picker-header">
+        <span>Routes</span>
+        <button id="route-picker-close" type="button" aria-label="Close">&times;</button>
+      </div>
       <input type="text" id="route-search" placeholder="Search routes" />
       <div id="mode-tabs"></div>
       <div id="route-list"></div>

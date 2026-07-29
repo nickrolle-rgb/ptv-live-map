@@ -40,7 +40,9 @@ export default async function handler(req, res) {
           lon: v.position?.longitude,
           bearing: v.position?.bearing ?? null,
           speed: v.position?.speed ?? null,
-          mode,
+          occupancyStatus: v.occupancyStatus ?? null,
+          stopId: v.stopId ?? null,
+          currentStatus: v.currentStatus ?? null,
         };
       });
 
