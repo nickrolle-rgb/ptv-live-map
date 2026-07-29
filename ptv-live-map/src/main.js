@@ -3,6 +3,7 @@ import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 import trainRouteNames from './data/train-routes.json';
 import tramRouteNames from './data/tram-routes.json';
+import vlineRouteNames from './data/vline-routes.json';
 
 const TILES = {
   light: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
@@ -10,7 +11,12 @@ const TILES = {
 };
 const ATTRIBUTION = '&copy; OpenStreetMap contributors &copy; CARTO';
 const LOCAL_RADIUS_KM = 5;
-const MODE_COLORS = { tram: '#6b46c1', train: '#1d4ed8' };
+
+const MODES = {
+  tram: { label: 'Trams', color: '#6b46c1', names: tramRouteNames, hasAlerts: true },
+  train: { label: 'Trains', color: '#1d4ed8', names: trainRouteNames, hasAlerts: true },
+  vline: { label: 'V/Line', color: '#8F1A95', names: vlineRouteNames, hasAlerts: false },
+};
 
 const map = L.map('app').setView([-37.8136, 144.9631], 13);
 let tileLayer = L.tileLayer(TILES.light, { attribution: ATTRIBUTION }).addTo(map);
@@ -33,7 +39,7 @@ let searchQuery = '';
 let activeTab = 'all';
 
 function routeInfo(mode, routeId) {
-  const table = mode === 'tram' ? tramRouteNames : trainRouteNames;
+  const table = MODES[mode]?.names || {};
   return table[routeId] || { name: routeId, color: null };
 }
 function baseRouteId(routeId) {
@@ -50,10 +56,8 @@ function pickAlertText(texts) {
   if (delay) return delay;
   return texts[0];
 }
-
 function routeStatus(mode, routeId) {
-  const texts = alertsByRoute.get(`${mode}:${routeId}`);
-  const alertText = pickAlertText(texts);
+  const alertText = pickAlertText(alertsByRoute.get(`${mode}:${routeId}`));
   if (alertText) return alertText;
   if (hasActiveReplacement(mode, routeId)) return 'Bus replacement';
   return '';
@@ -75,27 +79,26 @@ async function fetchJson(url) {
 }
 
 async function refreshData() {
-  const [trams, trains, tramAlerts, trainAlerts] = await Promise.all([
-    fetchJson('/api/vehicles?mode=tram').then((data) => data.map((v) => ({ ...v, mode: 'tram' }))),
-    fetchJson('/api/vehicles?mode=train').then((data) => data.map((v) => ({ ...v, mode: 'train' }))),
-    fetchJson('/api/alerts?mode=tram'),
-    fetchJson('/api/alerts?mode=train'),
-  ]);
+  const modeKeys = Object.keys(MODES);
 
-  allVehicles = [...trams, ...trains];
+  const vehicleResults = await Promise.all(
+    modeKeys.map((mode) => fetchJson(`/api/vehicles?mode=${mode}`).then((data) => data.map((v) => ({ ...v, mode }))))
+  );
+  allVehicles = vehicleResults.flat();
 
+  const alertResults = await Promise.all(
+    modeKeys.map((mode) => (MODES[mode].hasAlerts ? fetchJson(`/api/alerts?mode=${mode}`) : Promise.resolve([])))
+  );
   const newAlerts = new Map();
-  function collectAlerts(mode, alerts) {
-    alerts.forEach((a) => {
+  modeKeys.forEach((mode, i) => {
+    alertResults[i].forEach((a) => {
       a.routeIds.forEach((id) => {
         const key = `${mode}:${id}`;
         if (!newAlerts.has(key)) newAlerts.set(key, []);
         newAlerts.get(key).push(a.text);
       });
     });
-  }
-  collectAlerts('tram', tramAlerts);
-  collectAlerts('train', trainAlerts);
+  });
   alertsByRoute = newAlerts;
 
   renderMarkers();
@@ -118,9 +121,9 @@ function renderMarkers() {
     let marker = markers.get(key);
     if (!marker) {
       const info = routeInfo(v.mode, v.routeId);
-      const color = info.color || MODE_COLORS[v.mode] || '#666';
+      const color = info.color || MODES[v.mode]?.color || '#666';
       marker = L.circleMarker([v.lat, v.lon], { radius: 6, color, fillColor: color, fillOpacity: 0.9 });
-      marker.bindPopup(`<strong>${v.mode === 'tram' ? 'Tram' : 'Train'} route ${info.name}</strong><br>Vehicle: ${v.id}`);
+      marker.bindPopup(`<strong>${MODES[v.mode]?.label ?? v.mode} route ${info.name}</strong><br>Vehicle: ${v.id}`);
       markers.set(key, marker);
     } else {
       marker.setLatLng([v.lat, v.lon]);
@@ -141,6 +144,8 @@ function renderMarkers() {
 const toggleButton = document.getElementById('route-picker-toggle');
 const panel = document.getElementById('route-picker-panel');
 const searchInput = document.getElementById('route-search');
+const modeTabsEl = document.getElementById('mode-tabs');
+const routeListEl = document.getElementById('route-list');
 
 function updateToggleLabel() {
   toggleButton.textContent = selectedRoutes.size === 0
@@ -161,14 +166,14 @@ function buildRouteRow(container, mode, routeId, info) {
 
   const swatch = document.createElement('span');
   swatch.className = 'rp-swatch';
-  swatch.style.backgroundColor = info.color || MODE_COLORS[mode] || '#999';
+  swatch.style.backgroundColor = info.color || MODES[mode]?.color || '#999';
 
   const textWrap = document.createElement('div');
   textWrap.className = 'rp-text';
   const nameEl = document.createElement('div');
   nameEl.className = 'rp-name';
   nameEl.textContent = info.name;
-  if (selected) nameEl.style.color = info.color || MODE_COLORS[mode] || '';
+  if (selected) nameEl.style.color = info.color || MODES[mode]?.color || '';
   const statusEl = document.createElement('div');
   statusEl.className = 'rp-status';
   textWrap.appendChild(nameEl);
@@ -185,7 +190,7 @@ function buildRouteRow(container, mode, routeId, info) {
     } else {
       selectedRoutes.add(routeKey);
       row.classList.add('selected');
-      nameEl.style.color = info.color || MODE_COLORS[mode] || '';
+      nameEl.style.color = info.color || MODES[mode]?.color || '';
     }
     row.setAttribute('aria-checked', String(!isSelected));
     updateToggleLabel();
@@ -229,11 +234,54 @@ function renderRouteSection(container, mode, routeNames) {
     });
 }
 
+function buildModeTabs() {
+  modeTabsEl.innerHTML = '';
+  const allTab = document.createElement('div');
+  allTab.className = 'mode-tab active';
+  allTab.dataset.tab = 'all';
+  allTab.textContent = 'All';
+  modeTabsEl.appendChild(allTab);
+
+  Object.entries(MODES).forEach(([mode, config]) => {
+    const tab = document.createElement('div');
+    tab.className = 'mode-tab';
+    tab.dataset.tab = mode;
+    tab.textContent = config.label;
+    modeTabsEl.appendChild(tab);
+  });
+
+  modeTabsEl.querySelectorAll('.mode-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      modeTabsEl.querySelectorAll('.mode-tab').forEach((t) => t.classList.remove('active'));
+      tab.classList.add('active');
+      activeTab = tab.dataset.tab;
+      renderRoutePicker();
+    });
+  });
+}
+
+function buildRouteListSkeleton() {
+  routeListEl.innerHTML = '';
+  Object.entries(MODES).forEach(([mode, config]) => {
+    const group = document.createElement('div');
+    group.className = 'route-picker-group';
+    group.dataset.group = mode;
+    const heading = document.createElement('strong');
+    heading.textContent = config.label;
+    const rows = document.createElement('div');
+    rows.id = `${mode}-rows`;
+    group.appendChild(heading);
+    group.appendChild(rows);
+    routeListEl.appendChild(group);
+  });
+}
+
 function renderRoutePicker() {
-  document.querySelector('.route-picker-group[data-group="tram"]').style.display = activeTab === 'train' ? 'none' : '';
-  document.querySelector('.route-picker-group[data-group="train"]').style.display = activeTab === 'tram' ? 'none' : '';
-  renderRouteSection(document.getElementById('tram-rows'), 'tram', tramRouteNames);
-  renderRouteSection(document.getElementById('train-rows'), 'train', trainRouteNames);
+  Object.keys(MODES).forEach((mode) => {
+    const group = routeListEl.querySelector(`.route-picker-group[data-group="${mode}"]`);
+    group.style.display = activeTab === 'all' || activeTab === mode ? '' : 'none';
+    renderRouteSection(document.getElementById(`${mode}-rows`), mode, MODES[mode].names);
+  });
   updateRouteStatuses();
 }
 
@@ -248,25 +296,15 @@ function updateRouteStatuses() {
 }
 
 function initRoutePicker() {
+  buildModeTabs();
+  buildRouteListSkeleton();
   renderRoutePicker();
 
   toggleButton.addEventListener('click', () => { panel.hidden = !panel.hidden; });
-  document.addEventListener('click', (e) => {
-    if (!document.getElementById('route-picker').contains(e.target)) panel.hidden = true;
-  });
 
   searchInput.addEventListener('input', (e) => {
     searchQuery = e.target.value;
     renderRoutePicker();
-  });
-
-  document.querySelectorAll('.mode-tab').forEach((tab) => {
-    tab.addEventListener('click', () => {
-      document.querySelectorAll('.mode-tab').forEach((t) => t.classList.remove('active'));
-      tab.classList.add('active');
-      activeTab = tab.dataset.tab;
-      renderRoutePicker();
-    });
   });
 }
 

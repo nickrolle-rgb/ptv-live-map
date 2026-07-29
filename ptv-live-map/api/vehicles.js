@@ -4,6 +4,7 @@ import GtfsRealtimeBindings from 'gtfs-realtime-bindings';
 const FEEDS = {
   tram: 'https://api.opendata.transport.vic.gov.au/opendata/public-transport/gtfs/realtime/v1/tram/vehicle-positions',
   train: 'https://api.opendata.transport.vic.gov.au/opendata/public-transport/gtfs/realtime/v1/metro/vehicle-positions',
+  vline: 'https://api.opendata.transport.vic.gov.au/opendata/public-transport/gtfs/realtime/v1/vline/vehicle-positions',
 };
 
 function fetchBuffer(url, headers) {
@@ -22,7 +23,7 @@ function fetchBuffer(url, headers) {
 }
 
 export default async function handler(req, res) {
-  const mode = req.query.mode === 'train' ? 'train' : 'tram';
+  const mode = FEEDS[req.query.mode] ? req.query.mode : 'tram';
 
   try {
     const buffer = await fetchBuffer(FEEDS[mode], { KeyID: process.env.GTFS_API_KEY });
