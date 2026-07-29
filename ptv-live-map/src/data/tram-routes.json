@@ -1,0 +1,98 @@
+{
+  "aus:vic:vic-03-1:": {
+    "name": "1",
+    "color": "#B5BD00"
+  },
+  "aus:vic:vic-03-109:": {
+    "name": "109",
+    "color": "#E87722"
+  },
+  "aus:vic:vic-03-11:": {
+    "name": "11",
+    "color": "#6ECEB2"
+  },
+  "aus:vic:vic-03-12:": {
+    "name": "12",
+    "color": "#007E92"
+  },
+  "aus:vic:vic-03-16:": {
+    "name": "16",
+    "color": "#FBD872"
+  },
+  "aus:vic:vic-03-19:": {
+    "name": "19",
+    "color": "#8A1B61"
+  },
+  "aus:vic:vic-03-3:": {
+    "name": "3",
+    "color": "#8DC8E8"
+  },
+  "aus:vic:vic-03-30:": {
+    "name": "30",
+    "color": "#534F96"
+  },
+  "aus:vic:vic-03-35:": {
+    "name": "35",
+    "color": "#6B3529"
+  },
+  "aus:vic:vic-03-48:": {
+    "name": "48",
+    "color": "#333434"
+  },
+  "aus:vic:vic-03-5:": {
+    "name": "5",
+    "color": "#D50032"
+  },
+  "aus:vic:vic-03-57:": {
+    "name": "57",
+    "color": "#00C1D5"
+  },
+  "aus:vic:vic-03-58:": {
+    "name": "58",
+    "color": "#969696"
+  },
+  "aus:vic:vic-03-59:": {
+    "name": "59",
+    "color": "#00653A"
+  },
+  "aus:vic:vic-03-6:": {
+    "name": "6",
+    "color": "#01426A"
+  },
+  "aus:vic:vic-03-64:": {
+    "name": "64",
+    "color": "#00AB8E"
+  },
+  "aus:vic:vic-03-67:": {
+    "name": "67",
+    "color": "#956C58"
+  },
+  "aus:vic:vic-03-70:": {
+    "name": "70",
+    "color": "#F59BBB"
+  },
+  "aus:vic:vic-03-72:": {
+    "name": "72",
+    "color": "#9ABEAA"
+  },
+  "aus:vic:vic-03-75:": {
+    "name": "75",
+    "color": "#00A9E0"
+  },
+  "aus:vic:vic-03-78:": {
+    "name": "78",
+    "color": "#A0A0D6"
+  },
+  "aus:vic:vic-03-82:": {
+    "name": "82",
+    "color": "#D2D755"
+  },
+  "aus:vic:vic-03-86:": {
+    "name": "86",
+    "color": "#FFB500"
+  },
+  "aus:vic:vic-03-96:": {
+    "name": "96",
+    "color": "#C6007E"
+  }
+}

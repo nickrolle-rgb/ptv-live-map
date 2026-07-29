@@ -1,0 +1,142 @@
+{
+  "aus:vic:vic-02-ALM:": {
+    "name": "Alamein",
+    "color": "#152C6B"
+  },
+  "aus:vic:vic-02-ALM-R:": {
+    "name": "Alamein (bus replacement)",
+    "color": "#FE5000"
+  },
+  "aus:vic:vic-02-BEG:": {
+    "name": "Belgrave",
+    "color": "#152C6B"
+  },
+  "aus:vic:vic-02-BEG-R:": {
+    "name": "Belgrave (bus replacement)",
+    "color": "#FE5000"
+  },
+  "aus:vic:vic-02-CBE:": {
+    "name": "Cranbourne",
+    "color": "#34ACE1"
+  },
+  "aus:vic:vic-02-CBE-R:": {
+    "name": "Cranbourne (bus replacement)",
+    "color": "#FE5000"
+  },
+  "aus:vic:vic-02-CCL:": {
+    "name": "City Circle",
+    "color": "#0072CE"
+  },
+  "aus:vic:vic-02-CGB:": {
+    "name": "Craigieburn",
+    "color": "#FFBE00"
+  },
+  "aus:vic:vic-02-CGB-R:": {
+    "name": "Craigieburn (bus replacement)",
+    "color": "#FE5000"
+  },
+  "aus:vic:vic-02-FKN:": {
+    "name": "Frankston",
+    "color": "#028430"
+  },
+  "aus:vic:vic-02-FKN-R:": {
+    "name": "Frankston (bus replacement)",
+    "color": "#FE5000"
+  },
+  "aus:vic:vic-02-GWY:": {
+    "name": "Glen Waverley",
+    "color": "#152C6B"
+  },
+  "aus:vic:vic-02-GWY-R:": {
+    "name": "Glen Waverley (bus replacement)",
+    "color": "#FE5000"
+  },
+  "aus:vic:vic-02-HBE:": {
+    "name": "Hurstbridge",
+    "color": "#BE1014"
+  },
+  "aus:vic:vic-02-HBE-R:": {
+    "name": "Hurstbridge (bus replacement)",
+    "color": "#FE5000"
+  },
+  "aus:vic:vic-02-LIL:": {
+    "name": "Lilydale",
+    "color": "#152C6B"
+  },
+  "aus:vic:vic-02-LIL-R:": {
+    "name": "Lilydale (bus replacement)",
+    "color": "#FE5000"
+  },
+  "aus:vic:vic-02-MDD:": {
+    "name": "Mernda",
+    "color": "#BE1014"
+  },
+  "aus:vic:vic-02-MDD-R:": {
+    "name": "Mernda (bus replacement)",
+    "color": "#FE5000"
+  },
+  "aus:vic:vic-02-PKM:": {
+    "name": "Pakenham",
+    "color": "#34ACE1"
+  },
+  "aus:vic:vic-02-PKM-R:": {
+    "name": "Pakenham (bus replacement)",
+    "color": "#FE5000"
+  },
+  "aus:vic:vic-02-RCE:": {
+    "name": "Flemington Racecourse",
+    "color": "#95979A"
+  },
+  "aus:vic:vic-02-RCE-R:": {
+    "name": "City (bus replacement)",
+    "color": "#FE5000"
+  },
+  "aus:vic:vic-02-SHM:": {
+    "name": "Sandringham",
+    "color": "#F178AF"
+  },
+  "aus:vic:vic-02-SHM-R:": {
+    "name": "Sandringham (bus replacement)",
+    "color": "#FE5000"
+  },
+  "aus:vic:vic-02-STY:": {
+    "name": "Stony Point",
+    "color": "#028430"
+  },
+  "aus:vic:vic-02-STY-R:": {
+    "name": "Stony Point - Frankston (bus replacement)",
+    "color": "#FE5000"
+  },
+  "aus:vic:vic-02-SUY:": {
+    "name": "Sunbury",
+    "color": "#34ACE1"
+  },
+  "aus:vic:vic-02-SUY-R:": {
+    "name": "Sunbury (bus replacement)",
+    "color": "#FE5000"
+  },
+  "aus:vic:vic-02-UFD:": {
+    "name": "Upfield",
+    "color": "#FFBE00"
+  },
+  "aus:vic:vic-02-UFD-R:": {
+    "name": "Upfield (bus replacement)",
+    "color": "#FE5000"
+  },
+  "aus:vic:vic-02-WER:": {
+    "name": "Werribee",
+    "color": "#F178AF"
+  },
+  "aus:vic:vic-02-WER-R:": {
+    "name": "Werribee (bus replacement)",
+    "color": "#FE5000"
+  },
+  "aus:vic:vic-02-WIL:": {
+    "name": "Williamstown",
+    "color": "#F178AF"
+  },
+  "aus:vic:vic-02-WIL-R:": {
+    "name": "Williamstown (bus replacement)",
+    "color": "#FE5000"
+  }
+}

@@ -7,7 +7,31 @@
     <title>ptv-live-map</title>
   </head>
   <body>
-    <div id="app"></div>
+<div id="controls">
+  <div id="route-picker">
+    <button id="route-picker-toggle" type="button">All vehicles (near me) ▾</button>
+    <div id="route-picker-panel" hidden>
+      <input type="text" id="route-search" placeholder="Search routes" />
+      <div id="mode-tabs">
+        <div class="mode-tab active" data-tab="all">All</div>
+        <div class="mode-tab" data-tab="tram">Trams</div>
+        <div class="mode-tab" data-tab="train">Trains</div>
+      </div>
+      <div id="route-list">
+        <div class="route-picker-group" data-group="tram">
+          <strong>Trams</strong>
+          <div id="tram-rows"></div>
+        </div>
+        <div class="route-picker-group" data-group="train">
+          <strong>Trains</strong>
+          <div id="train-rows"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="app"></div>
+<div id="app"></div>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
