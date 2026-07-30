@@ -736,17 +736,33 @@ async function refreshBusData() {
 async function refreshBusDataNow() {
   await refreshBusData();
   composeVehicles();
+  markDataRefreshed();
   renderMarkers();
   renderRoutePicker();
 }
 
-let lastRenderAt = null;
-function renderMarkers() {
+// animationDuration should reflect the real elapsed time between actual vehicle-data
+// refreshes — but renderMarkers() is also called from several visibility-only paths
+// (selecting/deselecting a route, the geolocation callback re-evaluating "near me",
+// lazily-loaded headsigns arriving) that don't fetch new positions. Recomputing this
+// on every renderMarkers() call let those extra, more-frequent-than-10s calls stomp the
+// timing baseline — e.g. walking (triggering the geolocation visibility refresh every
+// time you cover ~20m) made the *next* real cycle's duration measure a much shorter
+// span than actually passed, so animations rushed to finish early and then sat idle,
+// looking sparse and inconsistent. Only markDataRefreshed() (called when vehicle data
+// actually changes) updates this now; renderMarkers() just reads the current value.
+let lastDataRefreshAt = null;
+let currentAnimationDuration = REFRESH_INTERVAL_MS;
+function markDataRefreshed() {
   const now = Date.now();
-  const animationDuration = lastRenderAt
-    ? Math.min(Math.max(now - lastRenderAt, 2000), REFRESH_INTERVAL_MS * 3)
+  currentAnimationDuration = lastDataRefreshAt
+    ? Math.min(Math.max(now - lastDataRefreshAt, 2000), REFRESH_INTERVAL_MS * 3)
     : REFRESH_INTERVAL_MS;
-  lastRenderAt = now;
+  lastDataRefreshAt = now;
+}
+
+function renderMarkers() {
+  const animationDuration = currentAnimationDuration;
 
   const seen = new Set();
   const hasSelection = selectedRoutes.size > 0;
@@ -1478,6 +1494,7 @@ async function scheduleRefresh() {
   try {
     await Promise.all([refreshData(), refreshBusData()]);
     composeVehicles();
+    markDataRefreshed();
     renderMarkers();
     updateRouteStatuses();
     updateDiscoveryPane();
