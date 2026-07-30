@@ -736,34 +736,11 @@ async function refreshBusData() {
 async function refreshBusDataNow() {
   await refreshBusData();
   composeVehicles();
-  markDataRefreshed();
   renderMarkers();
   renderRoutePicker();
 }
 
-// animationDuration should reflect the real elapsed time between actual vehicle-data
-// refreshes — but renderMarkers() is also called from several visibility-only paths
-// (selecting/deselecting a route, the geolocation callback re-evaluating "near me",
-// lazily-loaded headsigns arriving) that don't fetch new positions. Recomputing this
-// on every renderMarkers() call let those extra, more-frequent-than-10s calls stomp the
-// timing baseline — e.g. walking (triggering the geolocation visibility refresh every
-// time you cover ~20m) made the *next* real cycle's duration measure a much shorter
-// span than actually passed, so animations rushed to finish early and then sat idle,
-// looking sparse and inconsistent. Only markDataRefreshed() (called when vehicle data
-// actually changes) updates this now; renderMarkers() just reads the current value.
-let lastDataRefreshAt = null;
-let currentAnimationDuration = REFRESH_INTERVAL_MS;
-function markDataRefreshed() {
-  const now = Date.now();
-  currentAnimationDuration = lastDataRefreshAt
-    ? Math.min(Math.max(now - lastDataRefreshAt, 2000), REFRESH_INTERVAL_MS * 3)
-    : REFRESH_INTERVAL_MS;
-  lastDataRefreshAt = now;
-}
-
 function renderMarkers() {
-  const animationDuration = currentAnimationDuration;
-
   const seen = new Set();
   const hasSelection = selectedRoutes.size > 0;
   const nearbyRouteKeys = new Set();
@@ -790,6 +767,7 @@ function renderMarkers() {
       marker = L.marker([v.lat, v.lon], { icon: buildVehicleIcon(v.mode, color, initialBearing, false) });
       marker._lastRealLatLng = L.latLng(v.lat, v.lon);
       marker._lastRawLatLng = L.latLng(v.lat, v.lon);
+      marker._lastRawUpdateAt = Date.now();
       marker._bearing = initialBearing;
       marker._lastMovedAt = Date.now();
       marker.bindPopup(buildPopupContent(v, info, initialBearing, false));
@@ -816,6 +794,21 @@ function renderMarkers() {
       // marker in place and cancels whatever was still genuinely in flight.
       const rawChanged = !marker._lastRawLatLng || marker._lastRawLatLng.lat !== v.lat || marker._lastRawLatLng.lng !== v.lon;
       if (rawChanged) {
+        // Real vehicles update at very different, often much sparser cadences than our
+        // 10s poll — measured live: every single real position change observed over a
+        // 2.5-minute window had a gap of at least 20s since that vehicle's previous
+        // change, some past 60s. Using a single global "since last refresh" duration
+        // for every vehicle meant one that had been stale for 50s still had its next
+        // (much larger) jump squeezed into ~10s, making it visibly dash past several
+        // stops before decelerating hard — exactly the "stopped for ages, then speeds
+        // past 2 stops" pattern reported. Duration is now based on how long it's
+        // actually been since *this* vehicle's own last real position change, capped
+        // at 90s so a very long gap doesn't turn into an oddly slow-motion glide.
+        const now = Date.now();
+        const vehicleAnimationDuration = marker._lastRawUpdateAt
+          ? Math.min(Math.max(now - marker._lastRawUpdateAt, 2000), 90000)
+          : REFRESH_INTERVAL_MS;
+        marker._lastRawUpdateAt = now;
         marker._lastRawLatLng = rawNext;
 
         // While confirmed dwelling at a stop, animate to the stop's precise
@@ -826,7 +819,7 @@ function renderMarkers() {
         const next = dwelling ? L.latLng(stopInfo.lat, stopInfo.lon) : rawNext;
 
         const snappedPath = routeSnappedPath(v.mode, baseRouteId(v.routeId), prev.lat, prev.lng, next.lat, next.lng);
-        animateMarkerTo(marker, snappedPath || [[prev.lat, prev.lng], [next.lat, next.lng]], animationDuration);
+        animateMarkerTo(marker, snappedPath || [[prev.lat, prev.lng], [next.lat, next.lng]], vehicleAnimationDuration);
         marker._lastRealLatLng = next;
       }
     }
@@ -1494,7 +1487,6 @@ async function scheduleRefresh() {
   try {
     await Promise.all([refreshData(), refreshBusData()]);
     composeVehicles();
-    markDataRefreshed();
     renderMarkers();
     updateRouteStatuses();
     updateDiscoveryPane();
