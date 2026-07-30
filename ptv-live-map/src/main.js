@@ -13,6 +13,8 @@ import vlineStops from './data/vline-stops.json';
 import trainStopNames from './data/train-stop-names.json';
 import tramStopNames from './data/tram-stop-names.json';
 import vlineStopNames from './data/vline-stop-names.json';
+import metroBusRoutes from './data/metro-bus-routes.json';
+import regionalBusRoutes from './data/regional-bus-routes.json';
 
 const TILES = {
   light: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
@@ -30,6 +32,14 @@ const MODES = {
   train: { label: 'Trains', color: '#1d4ed8', names: trainRouteNames, hasAlerts: true, shapes: trainShapes, stops: trainStops, stopNames: trainStopNames },
   vline: { label: 'V/Line', color: '#8F1A95', names: vlineRouteNames, hasAlerts: false, shapes: vlineShapes, stops: vlineStops, stopNames: vlineStopNames },
 };
+
+// Buses are deliberately NOT part of MODES: that object drives the mode tabs, the
+// browsable route list, and refreshData()'s unconditional per-mode fetch every 10s —
+// none of which should apply to buses (~950 routes, ~1,500 concurrent vehicles across
+// Metro + Regional). Buses are only ever fetched for a route the user has explicitly
+// searched and picked; see the "Bus support" section below.
+const BUS_ROUTES = { ...metroBusRoutes, ...regionalBusRoutes };
+const BUS_LABEL = 'Bus';
 
 const map = L.map('app').setView([-37.8136, 144.9631], 13);
 let tileLayer = L.tileLayer(TILES.light, { attribution: ATTRIBUTION }).addTo(map);
@@ -52,6 +62,7 @@ darkQuery.addEventListener('change', (e) => {
 
 const markers = new Map();
 let allVehicles = [];
+let coreVehicles = [];
 let alertsByRoute = new Map();
 let tripUpdatesByTrip = new Map();
 const tripHeadsignsByMode = {};
@@ -62,6 +73,52 @@ let searchQuery = '';
 let activeTab = 'all';
 const routeShapeLayers = new Map();
 const autoShapeKeys = new Set();
+
+// Bus support state (see BUS_ROUTES above for why this is separate from MODES).
+const busShapeLoaders = import.meta.glob('./data/bus-shapes/*.json');
+const busTripInfoLoaders = {
+  metro: () => import('./data/metro-bus-trip-info.json'),
+  regional: () => import('./data/regional-bus-trip-info.json'),
+};
+const busStopNameLoaders = {
+  metro: () => import('./data/metro-bus-stop-names.json'),
+  regional: () => import('./data/regional-bus-stop-names.json'),
+};
+const busTripInfoByRegion = {};
+const busStopNamesByRegion = {};
+const busShapesByRoute = {};
+const selectedBusRoutes = new Set();
+let busVehicles = [];
+
+function ensureBusTripInfo(region) {
+  if (!busTripInfoByRegion[region]) {
+    busTripInfoByRegion[region] = busTripInfoLoaders[region]().then((mod) => {
+      busTripInfoByRegion[region] = mod.default;
+      return mod.default;
+    });
+  }
+  return Promise.resolve(busTripInfoByRegion[region]);
+}
+function ensureBusStopNames(region) {
+  if (!busStopNamesByRegion[region]) {
+    busStopNamesByRegion[region] = busStopNameLoaders[region]().then((mod) => {
+      busStopNamesByRegion[region] = mod.default;
+      renderMarkers();
+      return mod.default;
+    });
+  }
+  return Promise.resolve(busStopNamesByRegion[region]);
+}
+function ensureBusShape(routeId) {
+  if (busShapesByRoute[routeId]) return Promise.resolve(busShapesByRoute[routeId]);
+  const loader = busShapeLoaders[`./data/bus-shapes/${routeId}.json`];
+  if (!loader) return Promise.resolve(null);
+  return loader().then((mod) => {
+    busShapesByRoute[routeId] = mod.default;
+    linePrepCache.delete(`bus:${routeId}`);
+    return mod.default;
+  });
+}
 
 function hexToRgb(hex) {
   const clean = hex.replace('#', '');
@@ -86,6 +143,10 @@ function readableTextColor(hex, dark) {
 }
 
 function routeInfo(mode, routeId) {
+  if (mode === 'bus') {
+    const bus = BUS_ROUTES[routeId];
+    return bus ? { name: bus.shortName, color: bus.color } : { name: routeId, color: null };
+  }
   const table = MODES[mode]?.names || {};
   return table[routeId] || { name: routeId, color: null };
 }
@@ -117,6 +178,84 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   const a = Math.sin(dLat / 2) ** 2 +
     Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Route-snapped animation: rather than a straight GPS-to-GPS lerp (which visibly cuts
+// corners off curved track/road), the marker walks the actual drawn route line between
+// the two GPS pings' projected positions. Lines are prepared (cumulative arc-length
+// built) once per route and cached, since many vehicles share the same route.
+const linePrepCache = new Map();
+function prepareLine(points) {
+  const cumulative = [0];
+  for (let i = 1; i < points.length; i++) {
+    cumulative.push(cumulative[i - 1] + haversineKm(points[i - 1][0], points[i - 1][1], points[i][0], points[i][1]));
+  }
+  return { points, cumulative };
+}
+function getPreparedLines(mode, routeId) {
+  const key = `${mode}:${routeId}`;
+  if (!linePrepCache.has(key)) {
+    const lines = mode === 'bus' ? (busShapesByRoute[routeId] || []) : (MODES[mode]?.shapes?.[routeId] || []);
+    linePrepCache.set(key, lines.filter((pts) => pts.length >= 2).map(prepareLine));
+  }
+  return linePrepCache.get(key);
+}
+// Nearest point on a prepared line to (lat, lon), via a local flat-plane projection
+// per segment (accurate enough at street/track scale) combined with the line's
+// haversine-based cumulative arc-length for the along-line position.
+function projectOntoLine(prepared, lat, lon) {
+  const { points, cumulative } = prepared;
+  let best = null;
+  for (let i = 0; i < points.length - 1; i++) {
+    const [lat1, lon1] = points[i];
+    const [lat2, lon2] = points[i + 1];
+    const kmPerLonDeg = 111.32 * Math.cos((lat1 * Math.PI) / 180);
+    const kmPerLatDeg = 110.574;
+    const dx = (lon2 - lon1) * kmPerLonDeg;
+    const dy = (lat2 - lat1) * kmPerLatDeg;
+    const px = (lon - lon1) * kmPerLonDeg;
+    const py = (lat - lat1) * kmPerLatDeg;
+    const segLenSq = dx * dx + dy * dy;
+    const t = segLenSq > 0 ? Math.max(0, Math.min(1, (px * dx + py * dy) / segLenSq)) : 0;
+    const distanceKm = Math.hypot(px - t * dx, py - t * dy);
+    const arcLengthKm = cumulative[i] + t * Math.sqrt(segLenSq);
+    if (!best || distanceKm < best.distanceKm) best = { distanceKm, arcLengthKm };
+  }
+  return best;
+}
+const SNAP_MAX_DISTANCE_KM = 0.15;
+function snapToRoute(mode, routeId, lat, lon) {
+  const lines = getPreparedLines(mode, routeId);
+  let best = null;
+  let bestLine = null;
+  lines.forEach((line) => {
+    const proj = projectOntoLine(line, lat, lon);
+    if (proj && (!best || proj.distanceKm < best.distanceKm)) {
+      best = proj;
+      bestLine = line;
+    }
+  });
+  if (!best || best.distanceKm > SNAP_MAX_DISTANCE_KM) return null;
+  return { line: bestLine, arcLengthKm: best.arcLengthKm };
+}
+// Builds an animation path that follows the shape line between two arc-length
+// positions, inserting any shape vertices in between so the marker traces the curve.
+function buildSnappedPath(line, fromArcKm, toArcKm, fromPoint, toPoint) {
+  const { points, cumulative } = line;
+  const via = [];
+  for (let i = 0; i < points.length; i++) {
+    if (cumulative[i] > fromArcKm && cumulative[i] < toArcKm) via.push(points[i]);
+  }
+  return [fromPoint, ...via, toPoint];
+}
+const SNAP_BACKWARD_TOLERANCE_KM = 0.05;
+function routeSnappedPath(mode, routeId, prevLat, prevLon, nextLat, nextLon) {
+  const snappedNext = snapToRoute(mode, routeId, nextLat, nextLon);
+  if (!snappedNext) return null;
+  const projPrev = projectOntoLine(snappedNext.line, prevLat, prevLon);
+  if (!projPrev || projPrev.distanceKm > SNAP_MAX_DISTANCE_KM) return null;
+  if (snappedNext.arcLengthKm < projPrev.arcLengthKm - SNAP_BACKWARD_TOLERANCE_KM) return null;
+  return buildSnappedPath(snappedNext.line, projPrev.arcLengthKm, snappedNext.arcLengthKm, [prevLat, prevLon], [nextLat, nextLon]);
 }
 
 const COMPASS_POINTS = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW'];
@@ -175,9 +314,10 @@ function occupancyLabel(status) {
   return status === null || status === undefined ? null : OCCUPANCY_LABELS[status] ?? null;
 }
 
-function resolveStop(mode, stopId) {
+function resolveStop(mode, stopId, region) {
   if (!stopId) return null;
-  const entry = MODES[mode]?.stopNames?.[stopId];
+  const table = mode === 'bus' ? busStopNamesByRegion[region] : MODES[mode]?.stopNames;
+  const entry = table?.[stopId];
   if (!entry) return null;
   const [name, lat, lon] = entry;
   return { name, lat, lon };
@@ -200,13 +340,14 @@ const STOP_SANITY_KM = {
   tram: { at: 0.6, next: 3 },
   train: { at: 0.6, next: 10 },
   vline: { at: 1, next: 60 },
+  bus: { at: 0.6, next: 5 },
 };
 
-function nextStopInfo(mode, tripId, vLat, vLon) {
+function nextStopInfo(mode, tripId, vLat, vLon, region) {
   if (!tripId || vLat == null || vLon == null) return null;
   const update = tripUpdatesByTrip.get(`${mode}:${tripId}`);
   if (!update) return null;
-  const stop = resolveStop(mode, update.stopId);
+  const stop = resolveStop(mode, update.stopId, region);
   if (!stop) return null;
 
   const distanceKm = haversineKm(vLat, vLon, stop.lat, stop.lon);
@@ -231,12 +372,13 @@ function headsignFor(mode, tripId) {
 }
 
 function buildPopupContent(v, info, bearing, moving) {
-  const parts = [`<strong>${MODES[v.mode]?.label ?? v.mode} route ${info.name}</strong>`, `Vehicle: ${v.id}`];
-  const headsign = headsignFor(v.mode, v.tripId);
+  const modeLabel = v.mode === 'bus' ? BUS_LABEL : (MODES[v.mode]?.label ?? v.mode);
+  const parts = [`<strong>${modeLabel} route ${info.name}</strong>`, `Vehicle: ${v.id}`];
+  const headsign = v.mode === 'bus' ? v.headsign : headsignFor(v.mode, v.tripId);
   if (headsign) parts.push(`To: ${headsign}`);
   if (moving) parts.push(`Heading: ${bearingToCompass(bearing)}`);
   else parts.push('Status: stationary');
-  const next = nextStopInfo(v.mode, v.tripId, v.lat, v.lon);
+  const next = nextStopInfo(v.mode, v.tripId, v.lat, v.lon, v.region);
   if (next) {
     if (next.eta == null) parts.push(`${next.label}: ${next.name}`);
     else if (next.etaVerb) parts.push(`${next.label}: ${next.name} (${next.etaVerb} ${next.eta})`);
@@ -251,6 +393,7 @@ const MODE_SHAPES = {
   tram: { type: 'polygon', points: '8,2 14,12 8,7 2,12' },
   train: { type: 'polygon', points: '8,2 14,12 2,12' },
   vline: { type: 'chevron', points: '3,10 8,3 13,10' },
+  bus: { type: 'polygon', points: '4,2 12,2 14,7 12,12 4,12 2,7' },
 };
 
 function buildVehicleIcon(mode, color, bearing, moving) {
@@ -269,12 +412,30 @@ function buildUserLocationIcon() {
   return L.divIcon({ className: 'user-location-icon', html, iconSize: [14, 14], iconAnchor: [7, 7] });
 }
 
-function animateMarkerTo(marker, fromLatLng, toLatLng, duration) {
+function animateMarkerTo(marker, path, duration) {
+  const cumulative = [0];
+  for (let i = 1; i < path.length; i++) {
+    cumulative.push(cumulative[i - 1] + haversineKm(path[i - 1][0], path[i - 1][1], path[i][0], path[i][1]));
+  }
+  const total = cumulative[cumulative.length - 1];
   const startTime = performance.now();
   function step(now) {
     const t = Math.min((now - startTime) / duration, 1);
-    const lat = fromLatLng.lat + (toLatLng.lat - fromLatLng.lat) * t;
-    const lon = fromLatLng.lng + (toLatLng.lng - fromLatLng.lng) * t;
+    let lat, lon;
+    if (total === 0) {
+      [lat, lon] = path[path.length - 1];
+    } else {
+      const targetKm = t * total;
+      let i = 0;
+      while (i < cumulative.length - 2 && cumulative[i + 1] < targetKm) i++;
+      const segStart = cumulative[i];
+      const segEnd = cumulative[i + 1];
+      const segT = segEnd > segStart ? (targetKm - segStart) / (segEnd - segStart) : 0;
+      const [lat1, lon1] = path[i];
+      const [lat2, lon2] = path[i + 1];
+      lat = lat1 + (lat2 - lat1) * segT;
+      lon = lon1 + (lon2 - lon1) * segT;
+    }
     marker.setLatLng([lat, lon]);
     if (t < 1) marker._animFrame = requestAnimationFrame(step);
   }
@@ -336,6 +497,23 @@ function clearAutoRouteShapes() {
   autoShapeKeys.clear();
 }
 
+// Bus shapes are lazy-loaded per route (see ensureBusShape) rather than looked up in
+// an eagerly-bundled MODES[mode].shapes table, since there's no small combined file at
+// bus's scale (~950 routes). Reuses the same `routeShapeLayers` map as the other
+// modes (keyed `bus:${routeId}`), so hideRouteShape('bus', routeId) works unchanged.
+function showBusRouteShape(routeId) {
+  const routeKey = `bus:${routeId}`;
+  if (routeShapeLayers.has(routeKey)) return;
+  ensureBusShape(routeId).then((lines) => {
+    if (!lines || lines.length === 0) return;
+    if (!selectedBusRoutes.has(routeId) || routeShapeLayers.has(routeKey)) return;
+    const color = routeInfo('bus', routeId).color || '#FF8200';
+    const pathColor = mixWith(color, { r: 0, g: 0, b: 0 }, 0.35);
+    const layers = lines.map((points) => L.polyline(points, { color: pathColor, weight: 3, opacity: 0.55 }));
+    routeShapeLayers.set(routeKey, L.layerGroup(layers).addTo(map));
+  });
+}
+
 async function fetchJson(url) {
   const res = await fetch(url);
   if (!res.ok) return [];
@@ -351,7 +529,7 @@ async function refreshData() {
     Promise.all(modeKeys.map((mode) => fetchJson(`/api/trip-updates?mode=${mode}`))),
   ]);
 
-  allVehicles = vehicleResults.flat();
+  coreVehicles = vehicleResults.flat();
 
   const newAlerts = new Map();
   modeKeys.forEach((mode, i) => {
@@ -371,10 +549,63 @@ async function refreshData() {
       newTripUpdates.set(`${mode}:${tripId}`, update);
     });
   });
+  // refreshBusData() maintains its own `bus:`-prefixed entries on the same shared map
+  // independently (runs concurrently with this function) — carry them forward here so
+  // whichever of the two finishes last doesn't wipe out the other's contribution.
+  tripUpdatesByTrip.forEach((update, key) => {
+    if (key.startsWith('bus:')) newTripUpdates.set(key, update);
+  });
   tripUpdatesByTrip = newTripUpdates;
+}
 
+function composeVehicles() {
+  allVehicles = coreVehicles.concat(busVehicles);
+}
+
+// Buses are only ever fetched for routes explicitly selected via search (see
+// buildBusRouteRow) — never eagerly, unlike the three core modes above.
+async function refreshBusData() {
+  const metroRouteIds = [...selectedBusRoutes].filter((id) => BUS_ROUTES[id]?.region === 'metro');
+  if (metroRouteIds.length === 0) {
+    busVehicles = [];
+    return;
+  }
+  ensureBusStopNames('metro');
+
+  const shortNames = [...new Set(metroRouteIds.map((id) => BUS_ROUTES[id].shortName))];
+  const [tripInfo, vehicleResults, tripUpdatesRaw] = await Promise.all([
+    ensureBusTripInfo('metro'),
+    Promise.all(shortNames.map((sn) => fetchJson(`/api/vehicles?mode=bus&routeShortName=${encodeURIComponent(sn)}`))),
+    fetchJson('/api/trip-updates?mode=bus'),
+  ]);
+
+  [...tripUpdatesByTrip.keys()].forEach((key) => {
+    if (key.startsWith('bus:')) tripUpdatesByTrip.delete(key);
+  });
+  Object.entries(tripUpdatesRaw).forEach(([tripId, update]) => tripUpdatesByTrip.set(`bus:${tripId}`, update));
+
+  // The live feed's routeId is just the bare short-name (ambiguous — e.g. Metro and
+  // Regional both have a "600") and only ever returns Metro vehicles anyway (verified:
+  // Regional buses have no live tracking), but tripId->routeId resolution via
+  // tripInfo is what actually confirms and attributes each vehicle correctly.
+  const seenIds = new Set();
+  const resolved = [];
+  vehicleResults.flat().forEach((v) => {
+    if (seenIds.has(v.id)) return;
+    const info = tripInfo[v.tripId];
+    if (!info) return;
+    const [routeId, headsign] = info;
+    if (!selectedBusRoutes.has(routeId)) return;
+    seenIds.add(v.id);
+    resolved.push({ ...v, mode: 'bus', routeId, headsign, region: 'metro' });
+  });
+  busVehicles = resolved;
+}
+
+async function refreshBusDataNow() {
+  await refreshBusData();
+  composeVehicles();
   renderMarkers();
-  updateRouteStatuses();
 }
 
 let lastRenderAt = null;
@@ -395,9 +626,12 @@ function renderMarkers() {
     seen.add(key);
 
     const routeKey = `${v.mode}:${baseRouteId(v.routeId)}`;
+    // Bus vehicles only ever end up in allVehicles when their route was explicitly
+    // searched and selected (see refreshBusData) — always visible, no radius/selection
+    // gating like the other three modes.
     const withinRadius = !userLocation || haversineKm(userLocation.lat, userLocation.lon, v.lat, v.lon) <= LOCAL_RADIUS_KM;
-    const visible = hasSelection ? selectedRoutes.has(routeKey) : withinRadius;
-    if (!hasSelection && withinRadius) nearbyRouteKeys.add(routeKey);
+    const visible = v.mode === 'bus' ? true : (hasSelection ? selectedRoutes.has(routeKey) : withinRadius);
+    if (v.mode !== 'bus' && !hasSelection && withinRadius) nearbyRouteKeys.add(routeKey);
 
     const info = routeInfo(v.mode, v.routeId);
     const color = info.color || MODES[v.mode]?.color || '#666';
@@ -423,7 +657,8 @@ function renderMarkers() {
 
       marker.setIcon(buildVehicleIcon(v.mode, color, marker._bearing, moving));
       marker.setPopupContent(buildPopupContent(v, info, marker._bearing, moving));
-      animateMarkerTo(marker, prev, next, animationDuration);
+      const snappedPath = routeSnappedPath(v.mode, baseRouteId(v.routeId), prev.lat, prev.lng, next.lat, next.lng);
+      animateMarkerTo(marker, snappedPath || [[prev.lat, prev.lng], [next.lat, next.lng]], animationDuration);
       marker._lastRealLatLng = next;
     }
 
@@ -452,9 +687,10 @@ const modeTabsEl = document.getElementById('mode-tabs');
 const routeListEl = document.getElementById('route-list');
 
 function updateToggleLabel() {
-  toggleLabel.textContent = selectedRoutes.size === 0
+  const total = selectedRoutes.size + selectedBusRoutes.size;
+  toggleLabel.textContent = total === 0
     ? 'All vehicles (near me)'
-    : `${selectedRoutes.size} route${selectedRoutes.size > 1 ? 's' : ''} selected`;
+    : `${total} route${total > 1 ? 's' : ''} selected`;
 }
 
 function buildRouteRow(container, mode, routeId, info) {
@@ -513,6 +749,80 @@ function buildRouteRow(container, mode, routeId, info) {
     row.setAttribute('aria-checked', String(!isSelected));
     updateToggleLabel();
     renderMarkers();
+  }
+
+  row.addEventListener('click', toggle);
+  row.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+  });
+
+  container.appendChild(row);
+}
+
+// A single rider-facing bus route (e.g. "903 — Mordialloc - Altona") is frequently
+// split across several GTFS route_id rows in PTV's data — different operator
+// franchises covering different sections/times, sharing the same short name and
+// destination. `group` bundles their routeIds together so selecting the route once
+// pulls in vehicles from all of them, rather than just whichever operator's row
+// happened to get clicked.
+function buildBusRouteRow(container, group) {
+  const { shortName, longName, region, color, routeIds } = group;
+  const selected = routeIds.every((id) => selectedBusRoutes.has(id));
+  const rawColor = color || '';
+
+  const row = document.createElement('div');
+  row.className = 'rp-row' + (selected ? ' selected' : '');
+  row.dataset.busRouteIds = routeIds.join(',');
+  row.setAttribute('role', 'checkbox');
+  row.setAttribute('aria-checked', String(selected));
+  row.tabIndex = 0;
+
+  const swatch = document.createElement('span');
+  swatch.className = 'rp-swatch';
+  swatch.style.backgroundColor = rawColor || '#999';
+
+  const textWrap = document.createElement('div');
+  textWrap.className = 'rp-text';
+  const nameEl = document.createElement('div');
+  nameEl.className = 'rp-name';
+  const regionSuffix = region === 'regional' ? ' (Regional)' : '';
+  nameEl.textContent = `${shortName} — ${longName}${regionSuffix}`;
+  if (selected) nameEl.style.color = readableTextColor(rawColor, currentlyDark);
+  const statusEl = document.createElement('div');
+  statusEl.className = 'rp-status';
+  if (region === 'regional') {
+    statusEl.textContent = 'No live tracking available for this service';
+    statusEl.classList.add('has-disruption');
+  }
+  textWrap.appendChild(nameEl);
+  textWrap.appendChild(statusEl);
+
+  const checkEl = document.createElement('span');
+  checkEl.className = 'rp-check';
+  checkEl.textContent = '✓';
+  checkEl.setAttribute('aria-hidden', 'true');
+  if (selected) checkEl.style.color = readableTextColor(rawColor, currentlyDark);
+
+  row.appendChild(swatch);
+  row.appendChild(textWrap);
+  row.appendChild(checkEl);
+
+  function toggle() {
+    const isSelected = routeIds.every((id) => selectedBusRoutes.has(id));
+    if (isSelected) {
+      routeIds.forEach((id) => { selectedBusRoutes.delete(id); hideRouteShape('bus', id); });
+      row.classList.remove('selected');
+      nameEl.style.color = '';
+      checkEl.style.color = '';
+    } else {
+      routeIds.forEach((id) => { selectedBusRoutes.add(id); showBusRouteShape(id); });
+      row.classList.add('selected');
+      nameEl.style.color = readableTextColor(rawColor, currentlyDark);
+      checkEl.style.color = readableTextColor(rawColor, currentlyDark);
+    }
+    row.setAttribute('aria-checked', String(!isSelected));
+    updateToggleLabel();
+    refreshBusDataNow();
   }
 
   row.addEventListener('click', toggle);
@@ -627,6 +937,47 @@ function buildRouteListSkeleton() {
     group.appendChild(rows);
     routeListEl.appendChild(group);
   });
+
+  // Buses are deliberately not part of the mode-tab loop above (see BUS_ROUTES) — this
+  // group only ever becomes visible when the search box has a matching route number.
+  const busGroup = document.createElement('div');
+  busGroup.className = 'route-picker-group';
+  busGroup.dataset.group = 'bus';
+  busGroup.style.display = 'none';
+  const busHeading = document.createElement('strong');
+  busHeading.textContent = 'Buses';
+  const busRows = document.createElement('div');
+  busRows.id = 'bus-rows';
+  busGroup.appendChild(busHeading);
+  busGroup.appendChild(busRows);
+  routeListEl.appendChild(busGroup);
+}
+
+function renderBusSection() {
+  const group = routeListEl.querySelector('.route-picker-group[data-group="bus"]');
+  const rows = document.getElementById('bus-rows');
+  rows.innerHTML = '';
+  const query = searchQuery.trim().toLowerCase();
+  if (!query) { group.style.display = 'none'; return; }
+
+  const matches = Object.entries(BUS_ROUTES).filter(([, info]) => info.shortName && info.shortName.toLowerCase().startsWith(query));
+
+  const grouped = new Map();
+  matches.forEach(([routeId, info]) => {
+    const key = `${info.shortName} ${info.longName} ${info.region}`;
+    if (!grouped.has(key)) {
+      grouped.set(key, { shortName: info.shortName, longName: info.longName, region: info.region, color: info.color, routeIds: [] });
+    }
+    grouped.get(key).routeIds.push(routeId);
+  });
+
+  const groups = [...grouped.values()]
+    .sort((a, b) => a.shortName.localeCompare(b.shortName, undefined, { numeric: true }) || a.region.localeCompare(b.region))
+    .slice(0, 20);
+
+  if (groups.length === 0) { group.style.display = 'none'; return; }
+  group.style.display = '';
+  groups.forEach((g) => buildBusRouteRow(rows, g));
 }
 
 function renderRoutePicker() {
@@ -635,11 +986,12 @@ function renderRoutePicker() {
     group.style.display = activeTab === 'all' || activeTab === mode ? '' : 'none';
     renderRouteSection(document.getElementById(`${mode}-rows`), mode, MODES[mode].names);
   });
+  renderBusSection();
   updateRouteStatuses();
 }
 
 function updateRouteStatuses() {
-  document.querySelectorAll('.rp-row').forEach((row) => {
+  document.querySelectorAll('.rp-row[data-route-key]').forEach((row) => {
     const [mode, routeId] = row.dataset.routeKey.split(/:(.+)/);
     const statusEl = row.querySelector('.rp-status');
     const status = routeStatus(mode, routeId);
@@ -693,7 +1045,10 @@ function centerOnUser() {
 
 async function scheduleRefresh() {
   try {
-    await refreshData();
+    await Promise.all([refreshData(), refreshBusData()]);
+    composeVehicles();
+    renderMarkers();
+    updateRouteStatuses();
   } catch (err) {
     console.error(err);
   } finally {

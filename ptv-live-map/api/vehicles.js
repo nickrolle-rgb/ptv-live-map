@@ -6,11 +6,23 @@ const FEEDS = {
   tram: 'https://api.opendata.transport.vic.gov.au/opendata/public-transport/gtfs/realtime/v1/tram/vehicle-positions',
   train: 'https://api.opendata.transport.vic.gov.au/opendata/public-transport/gtfs/realtime/v1/metro/vehicle-positions',
   vline: 'https://api.opendata.transport.vic.gov.au/opendata/public-transport/gtfs/realtime/v1/vline/vehicle-positions',
+  bus: 'https://api.opendata.transport.vic.gov.au/opendata/public-transport/gtfs/realtime/v1/bus/vehicle-positions',
 };
 
 export default async function handler(req) {
-  const requestedMode = new URL(req.url).searchParams.get('mode');
+  const params = new URL(req.url).searchParams;
+  const requestedMode = params.get('mode');
   const mode = FEEDS[requestedMode] ? requestedMode : 'tram';
+
+  // Bus has ~1,500 concurrent vehicles across ~950 routes — only ever return the
+  // handful matching a specific searched route, never the unfiltered feed.
+  const routeShortName = params.get('routeShortName');
+  if (mode === 'bus' && !routeShortName) {
+    return new Response(JSON.stringify([]), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
 
   try {
     const upstream = await fetch(FEEDS[mode], { headers: { KeyID: process.env.GTFS_API_KEY } });
@@ -18,7 +30,7 @@ export default async function handler(req) {
     const buffer = await upstream.arrayBuffer();
     const feed = GtfsRealtimeBindings.transit_realtime.FeedMessage.decode(new Uint8Array(buffer));
 
-    const vehicles = feed.entity
+    let vehicles = feed.entity
       .filter((entity) => entity.vehicle)
       .map((entity) => {
         const v = entity.vehicle;
@@ -35,6 +47,8 @@ export default async function handler(req) {
           currentStatus: v.currentStatus ?? null,
         };
       });
+
+    if (mode === 'bus') vehicles = vehicles.filter((v) => v.routeId === routeShortName);
 
     return new Response(JSON.stringify(vehicles), {
       status: 200,
