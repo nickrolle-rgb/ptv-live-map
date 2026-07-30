@@ -795,6 +795,8 @@ const toggleButton = document.getElementById('route-picker-toggle');
 const toggleLabel = document.getElementById('route-picker-toggle-label');
 const panel = document.getElementById('route-picker-panel');
 const searchInput = document.getElementById('route-search');
+const searchWrap = document.getElementById('route-search-wrap');
+const searchClearButton = document.getElementById('route-search-clear');
 const closeButton = document.getElementById('route-picker-close');
 const modeTabsEl = document.getElementById('mode-tabs');
 const routeListEl = document.getElementById('route-list');
@@ -1146,21 +1148,28 @@ function buildRouteListSkeleton() {
   selectedGroup.appendChild(selectedRows);
   routeListEl.appendChild(selectedGroup);
 
-  // Favourites/Recent lead the Routes pane on an empty search, so reopening the panel
-  // to reselect a regular route doesn't require re-searching or re-scrolling.
-  [['favourites', 'Favourites'], ['recent', 'Recent']].forEach(([id, label]) => {
-    const groupEl = document.createElement('div');
-    groupEl.className = 'route-picker-group';
-    groupEl.dataset.group = id;
-    groupEl.style.display = 'none';
-    const heading = document.createElement('strong');
-    heading.textContent = label;
-    const rows = document.createElement('div');
-    rows.id = `${id}-rows`;
-    groupEl.appendChild(heading);
-    groupEl.appendChild(rows);
-    routeListEl.appendChild(groupEl);
-  });
+  // Favourites (with Recent as a subheading underneath) leads the Routes pane on an
+  // empty search, so reopening the panel to reselect a regular route doesn't require
+  // re-searching or re-scrolling.
+  const favGroup = document.createElement('div');
+  favGroup.className = 'route-picker-group';
+  favGroup.dataset.group = 'favourites';
+  favGroup.style.display = 'none';
+  const favHeading = document.createElement('strong');
+  favHeading.textContent = 'Favourites';
+  const favRows = document.createElement('div');
+  favRows.id = 'favourites-rows';
+  const recentHeading = document.createElement('strong');
+  recentHeading.id = 'recent-subheading';
+  recentHeading.className = 'rp-subheading';
+  recentHeading.textContent = 'Recent';
+  const recentRows = document.createElement('div');
+  recentRows.id = 'recent-rows';
+  favGroup.appendChild(favHeading);
+  favGroup.appendChild(favRows);
+  favGroup.appendChild(recentHeading);
+  favGroup.appendChild(recentRows);
+  routeListEl.appendChild(favGroup);
 
   Object.entries(MODES).forEach(([mode, config]) => {
     const group = document.createElement('div');
@@ -1255,27 +1264,27 @@ function renderEntryRow(container, entry) {
 
 function renderFavouritesSection() {
   const group = routeListEl.querySelector('.route-picker-group[data-group="favourites"]');
-  const rows = document.getElementById('favourites-rows');
-  rows.innerHTML = '';
-  if (searchQuery.trim() || favouriteEntries.length === 0) { group.style.display = 'none'; return; }
-  group.style.display = '';
-  favouriteEntries.forEach((entry) => renderEntryRow(rows, entry));
-}
+  const favRows = document.getElementById('favourites-rows');
+  const recentHeading = document.getElementById('recent-subheading');
+  const recentRows = document.getElementById('recent-rows');
+  favRows.innerHTML = '';
+  recentRows.innerHTML = '';
 
-function renderRecentSection() {
-  const group = routeListEl.querySelector('.route-picker-group[data-group="recent"]');
-  const rows = document.getElementById('recent-rows');
-  rows.innerHTML = '';
-  const filtered = recentEntries.filter((e) => !isFavourited(e));
-  if (searchQuery.trim() || filtered.length === 0) { group.style.display = 'none'; return; }
+  const filteredRecent = recentEntries.filter((e) => !isFavourited(e));
+  if (searchQuery.trim() || (favouriteEntries.length === 0 && filteredRecent.length === 0)) {
+    group.style.display = 'none';
+    return;
+  }
   group.style.display = '';
-  filtered.forEach((entry) => renderEntryRow(rows, entry));
+
+  favouriteEntries.forEach((entry) => renderEntryRow(favRows, entry));
+  recentHeading.style.display = filteredRecent.length > 0 ? '' : 'none';
+  filteredRecent.forEach((entry) => renderEntryRow(recentRows, entry));
 }
 
 function renderRoutePicker() {
   renderSelectedSection();
   renderFavouritesSection();
-  renderRecentSection();
   Object.keys(MODES).forEach((mode) => {
     const group = routeListEl.querySelector(`.route-picker-group[data-group="${mode}"]`);
     group.style.display = activeTab === 'all' || activeTab === mode ? '' : 'none';
@@ -1366,7 +1375,16 @@ function initRoutePicker() {
 
   searchInput.addEventListener('input', (e) => {
     searchQuery = e.target.value;
+    searchWrap.classList.toggle('has-text', searchQuery.length > 0);
     renderRoutePicker();
+  });
+
+  searchClearButton.addEventListener('click', () => {
+    searchInput.value = '';
+    searchQuery = '';
+    searchWrap.classList.remove('has-text');
+    renderRoutePicker();
+    searchInput.focus();
   });
 }
 

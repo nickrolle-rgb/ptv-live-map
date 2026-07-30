@@ -82,13 +82,22 @@ body.dark-mode {
 }
 #route-picker-close:hover { background: var(--row-hover); color: var(--text-primary); }
 
+#route-search-wrap { position: relative; margin-bottom: 10px; }
 #route-search {
-  width: 100%; box-sizing: border-box; padding: 8px 10px; font-size: 13px;
+  width: 100%; box-sizing: border-box; padding: 8px 30px 8px 10px; font-size: 13px;
   border-radius: 8px; border: 1px solid var(--panel-border);
-  background: var(--input-bg); color: var(--text-primary); margin-bottom: 10px;
+  background: var(--input-bg); color: var(--text-primary);
   transition: border-color 0.15s ease;
 }
 #route-search:focus { outline: none; border-color: #6b46c1; }
+#route-search-clear {
+  position: absolute; top: 50%; right: 4px; transform: translateY(-50%);
+  width: 22px; height: 22px; border: none; background: none; cursor: pointer;
+  font-size: 16px; line-height: 1; color: var(--text-muted); border-radius: 50%;
+  display: none; align-items: center; justify-content: center;
+}
+#route-search-clear:hover { background: var(--row-hover); color: var(--text-primary); }
+#route-search-wrap.has-text #route-search-clear { display: flex; }
 
 #mode-tabs { display: flex; gap: 4px; background: var(--input-bg); border-radius: 9px; padding: 3px; margin-bottom: 12px; }
 .mode-tab {
@@ -133,6 +142,7 @@ body.dark-mode {
   display: block; margin-bottom: 5px; font-size: 11px; font-weight: 700;
   letter-spacing: 0.05em; text-transform: uppercase; color: var(--text-muted);
 }
+.rp-subheading { margin-top: 10px; font-size: 10px; font-weight: 600; opacity: 0.75; }
 
 .rp-group-shared { border-left: 3px solid transparent; padding-left: 6px; margin: 5px 0; border-radius: 4px; }
 

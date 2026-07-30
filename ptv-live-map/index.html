@@ -26,7 +26,10 @@
         <div id="panel-track">
           <div id="discovery-pane" class="panel-pane"></div>
           <div id="routes-pane" class="panel-pane">
-            <input type="text" id="route-search" placeholder="Search routes" />
+            <div id="route-search-wrap">
+              <input type="text" id="route-search" placeholder="Search routes" />
+              <button type="button" id="route-search-clear" aria-label="Clear search">&times;</button>
+            </div>
             <div id="mode-tabs"></div>
             <div id="route-list"></div>
           </div>
