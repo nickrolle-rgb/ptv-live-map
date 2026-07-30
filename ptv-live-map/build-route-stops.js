@@ -1,9 +1,9 @@
 import { createReadStream, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
-const [, , tripsOutputPath, stopTimesPath, stopsPath, outputPath] = process.argv;
+const [, , tripsOutputPath, stopTimesPath, stopsPath, outputPath, namesOutputPath] = process.argv;
 if (!tripsOutputPath || !stopTimesPath || !stopsPath || !outputPath) {
-  console.error('Usage: node build-route-stops.js <route-trips.json> <stop_times.txt> <stops.txt> <output.json>');
+  console.error('Usage: node build-route-stops.js <route-trips.json> <stop_times.txt> <stops.txt> <output.json> [stop-names-output.json]');
   process.exit(1);
 }
 
@@ -87,3 +87,23 @@ mkdirSync('./src/data', { recursive: true });
 const json = JSON.stringify(output);
 writeFileSync(outputPath, json);
 console.log(`Wrote stops for ${Object.keys(output).length} routes to ${outputPath} (${(json.length / 1024).toFixed(1)} KB)`);
+
+if (namesOutputPath) {
+  // Reuses stopLookup/stopsByTrip already computed above — no extra pass over
+  // stop_times.txt needed. Used to let riders search a route by a station it serves,
+  // not just by route name.
+  const namesOutput = {};
+  Object.entries(routeTrips).forEach(([routeId, tripIds]) => {
+    const names = new Set();
+    tripIds.forEach((tripId) => {
+      (stopsByTrip.get(tripId) || []).forEach((s) => {
+        const stop = stopLookup.get(s.stopId);
+        if (stop) names.add(stop.name);
+      });
+    });
+    if (names.size > 0) namesOutput[routeId] = [...names];
+  });
+  const namesJson = JSON.stringify(namesOutput);
+  writeFileSync(namesOutputPath, namesJson);
+  console.log(`Wrote stop names for ${Object.keys(namesOutput).length} routes to ${namesOutputPath} (${(namesJson.length / 1024).toFixed(1)} KB)`);
+}

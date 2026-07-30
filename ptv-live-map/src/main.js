@@ -13,6 +13,7 @@ import vlineStops from './data/vline-stops.json';
 import trainStopNames from './data/train-stop-names.json';
 import tramStopNames from './data/tram-stop-names.json';
 import vlineStopNames from './data/vline-stop-names.json';
+import trainRouteStopNames from './data/train-route-stop-names.json';
 import metroBusRoutes from './data/metro-bus-routes.json';
 import regionalBusRoutes from './data/regional-bus-routes.json';
 
@@ -29,7 +30,7 @@ const TICK_LENGTH_M = 18;
 
 const MODES = {
   tram: { label: 'Trams', color: '#6b46c1', names: tramRouteNames, hasAlerts: true, shapes: tramShapes, stops: tramStops, stopNames: tramStopNames },
-  train: { label: 'Trains', color: '#1d4ed8', names: trainRouteNames, hasAlerts: true, shapes: trainShapes, stops: trainStops, stopNames: trainStopNames },
+  train: { label: 'Trains', color: '#1d4ed8', names: trainRouteNames, hasAlerts: true, shapes: trainShapes, stops: trainStops, stopNames: trainStopNames, routeStopNames: trainRouteStopNames },
   vline: { label: 'V/Line', color: '#8F1A95', names: vlineRouteNames, hasAlerts: false, shapes: vlineShapes, stops: vlineStops, stopNames: vlineStopNames },
 };
 
@@ -606,6 +607,7 @@ async function refreshBusDataNow() {
   await refreshBusData();
   composeVehicles();
   renderMarkers();
+  renderRoutePicker();
 }
 
 let lastRenderAt = null;
@@ -734,21 +736,15 @@ function buildRouteRow(container, mode, routeId, info) {
     const isSelected = selectedRoutes.has(routeKey);
     if (isSelected) {
       selectedRoutes.delete(routeKey);
-      row.classList.remove('selected');
-      nameEl.style.color = '';
-      checkEl.style.color = '';
       hideRouteShape(mode, routeId);
     } else {
       selectedRoutes.add(routeKey);
-      row.classList.add('selected');
-      nameEl.style.color = readableTextColor(rawColor, currentlyDark);
-      checkEl.style.color = readableTextColor(rawColor, currentlyDark);
       autoShapeKeys.delete(routeKey);
       showRouteShape(mode, routeId);
     }
-    row.setAttribute('aria-checked', String(!isSelected));
     updateToggleLabel();
     renderMarkers();
+    renderRoutePicker();
   }
 
   row.addEventListener('click', toggle);
@@ -811,16 +807,9 @@ function buildBusRouteRow(container, group) {
     const isSelected = routeIds.every((id) => selectedBusRoutes.has(id));
     if (isSelected) {
       routeIds.forEach((id) => { selectedBusRoutes.delete(id); hideRouteShape('bus', id); });
-      row.classList.remove('selected');
-      nameEl.style.color = '';
-      checkEl.style.color = '';
     } else {
       routeIds.forEach((id) => { selectedBusRoutes.add(id); showBusRouteShape(id); });
-      row.classList.add('selected');
-      nameEl.style.color = readableTextColor(rawColor, currentlyDark);
-      checkEl.style.color = readableTextColor(rawColor, currentlyDark);
     }
-    row.setAttribute('aria-checked', String(!isSelected));
     updateToggleLabel();
     refreshBusDataNow();
   }
@@ -839,8 +828,10 @@ function renderRouteSection(container, mode, routeNames) {
 
   const entries = Object.entries(routeNames).filter(([routeId, info]) => {
     if (routeId.endsWith('-R:')) return false;
-    if (query && !info.name.toLowerCase().includes(query)) return false;
-    return true;
+    if (!query) return true;
+    if (info.name.toLowerCase().includes(query)) return true;
+    const stopNames = MODES[mode]?.routeStopNames?.[routeId];
+    return Boolean(stopNames?.some((name) => name.toLowerCase().includes(query)));
   });
 
   const colorGroups = new Map();
@@ -925,6 +916,22 @@ function buildModeTabs() {
 
 function buildRouteListSkeleton() {
   routeListEl.innerHTML = '';
+
+  // Pinned to the top, above the per-mode/bus sections, so an already-selected route
+  // (especially a searched-then-selected bus, which otherwise has no other visible
+  // trace once the search box is cleared) is always one glance away to deselect.
+  const selectedGroup = document.createElement('div');
+  selectedGroup.className = 'route-picker-group';
+  selectedGroup.dataset.group = 'selected';
+  selectedGroup.style.display = 'none';
+  const selectedHeading = document.createElement('strong');
+  selectedHeading.textContent = 'Selected';
+  const selectedRows = document.createElement('div');
+  selectedRows.id = 'selected-rows';
+  selectedGroup.appendChild(selectedHeading);
+  selectedGroup.appendChild(selectedRows);
+  routeListEl.appendChild(selectedGroup);
+
   Object.entries(MODES).forEach(([mode, config]) => {
     const group = document.createElement('div');
     group.className = 'route-picker-group';
@@ -953,6 +960,26 @@ function buildRouteListSkeleton() {
   routeListEl.appendChild(busGroup);
 }
 
+// Groups a list of [routeId, info] bus entries by rider-facing identity (short name +
+// destination + region) — see buildBusRouteRow for why several GTFS route_ids can
+// represent what's really "one" route. Shared by search results and the Selected list.
+function groupBusEntries(entries) {
+  const grouped = new Map();
+  entries.forEach(([routeId, info]) => {
+    const key = `${info.shortName} ${info.longName} ${info.region}`;
+    if (!grouped.has(key)) {
+      grouped.set(key, { shortName: info.shortName, longName: info.longName, region: info.region, color: info.color, routeIds: [] });
+    }
+    grouped.get(key).routeIds.push(routeId);
+  });
+  return [...grouped.values()].sort((a, b) => a.shortName.localeCompare(b.shortName, undefined, { numeric: true }) || a.region.localeCompare(b.region));
+}
+
+function getSelectedBusGroups() {
+  const entries = [...selectedBusRoutes].map((routeId) => [routeId, BUS_ROUTES[routeId]]).filter(([, info]) => info);
+  return groupBusEntries(entries);
+}
+
 function renderBusSection() {
   const group = routeListEl.querySelector('.route-picker-group[data-group="bus"]');
   const rows = document.getElementById('bus-rows');
@@ -960,27 +987,34 @@ function renderBusSection() {
   const query = searchQuery.trim().toLowerCase();
   if (!query) { group.style.display = 'none'; return; }
 
-  const matches = Object.entries(BUS_ROUTES).filter(([, info]) => info.shortName && info.shortName.toLowerCase().startsWith(query));
-
-  const grouped = new Map();
-  matches.forEach(([routeId, info]) => {
-    const key = `${info.shortName} ${info.longName} ${info.region}`;
-    if (!grouped.has(key)) {
-      grouped.set(key, { shortName: info.shortName, longName: info.longName, region: info.region, color: info.color, routeIds: [] });
-    }
-    grouped.get(key).routeIds.push(routeId);
+  const matches = Object.entries(BUS_ROUTES).filter(([, info]) => {
+    if (!info.shortName) return false;
+    return info.shortName.toLowerCase().startsWith(query) || info.longName?.toLowerCase().includes(query);
   });
-
-  const groups = [...grouped.values()]
-    .sort((a, b) => a.shortName.localeCompare(b.shortName, undefined, { numeric: true }) || a.region.localeCompare(b.region))
-    .slice(0, 20);
+  const groups = groupBusEntries(matches).slice(0, 20);
 
   if (groups.length === 0) { group.style.display = 'none'; return; }
   group.style.display = '';
   groups.forEach((g) => buildBusRouteRow(rows, g));
 }
 
+function renderSelectedSection() {
+  const group = routeListEl.querySelector('.route-picker-group[data-group="selected"]');
+  const rows = document.getElementById('selected-rows');
+  rows.innerHTML = '';
+
+  if (selectedRoutes.size === 0 && selectedBusRoutes.size === 0) { group.style.display = 'none'; return; }
+  group.style.display = '';
+
+  selectedRoutes.forEach((routeKey) => {
+    const [mode, routeId] = routeKey.split(/:(.+)/);
+    buildRouteRow(rows, mode, routeId, routeInfo(mode, routeId));
+  });
+  getSelectedBusGroups().forEach((g) => buildBusRouteRow(rows, g));
+}
+
 function renderRoutePicker() {
+  renderSelectedSection();
   Object.keys(MODES).forEach((mode) => {
     const group = routeListEl.querySelector(`.route-picker-group[data-group="${mode}"]`);
     group.style.display = activeTab === 'all' || activeTab === mode ? '' : 'none';
