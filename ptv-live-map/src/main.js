@@ -54,6 +54,7 @@ const markers = new Map();
 let allVehicles = [];
 let alertsByRoute = new Map();
 let tripUpdatesByTrip = new Map();
+const tripHeadsignsByMode = {};
 let userLocation = null;
 let userLocationMarker = null;
 const selectedRoutes = new Set();
@@ -174,9 +175,12 @@ function occupancyLabel(status) {
   return status === null || status === undefined ? null : OCCUPANCY_LABELS[status] ?? null;
 }
 
-function stopName(mode, stopId) {
+function resolveStop(mode, stopId) {
   if (!stopId) return null;
-  return MODES[mode]?.stopNames?.[stopId] ?? null;
+  const entry = MODES[mode]?.stopNames?.[stopId];
+  if (!entry) return null;
+  const [name, lat, lon] = entry;
+  return { name, lat, lon };
 }
 
 function formatEtaMinutes(unixSeconds) {
@@ -185,33 +189,54 @@ function formatEtaMinutes(unixSeconds) {
   return mins <= 0 ? 'due' : `${mins} min`;
 }
 
-function nextStopInfo(mode, tripId) {
-  if (!tripId) return null;
+// Trip-updates' predicted arrival/departure times lag reality far more than the
+// vehicle's live GPS does (testing showed most "arrival already passed" entries were
+// still several km out, still en route) — so live distance to the claimed stop, not
+// the predicted time, decides "At" vs "Next stop" and whether to trust the entry at
+// all. Bounds are generous single-hop distances per mode (tram stops are close
+// together; V/Line stops can be tens of km apart), tighter for "At" since that implies
+// the vehicle is physically there right now.
+const STOP_SANITY_KM = {
+  tram: { at: 0.6, next: 3 },
+  train: { at: 0.6, next: 10 },
+  vline: { at: 1, next: 60 },
+};
+
+function nextStopInfo(mode, tripId, vLat, vLon) {
+  if (!tripId || vLat == null || vLon == null) return null;
   const update = tripUpdatesByTrip.get(`${mode}:${tripId}`);
   if (!update) return null;
-  const name = stopName(mode, update.stopId);
-  if (!name) return null;
+  const stop = resolveStop(mode, update.stopId);
+  if (!stop) return null;
 
-  const now = Date.now() / 1000;
+  const distanceKm = haversineKm(vLat, vLon, stop.lat, stop.lon);
+  const { at: atMaxKm, next: nextMaxKm } = STOP_SANITY_KM[mode];
+  if (distanceKm > nextMaxKm) return null;
+
   const { arrival, departure } = update;
-  const atStop = arrival != null && arrival <= now;
-
-  if (atStop) {
+  if (distanceKm <= atMaxKm) {
     return departure == null
-      ? { label: 'At', name, eta: null }
-      : { label: 'At', name, eta: formatEtaMinutes(departure), etaVerb: 'departing' };
+      ? { label: 'At', name: stop.name, eta: null }
+      : { label: 'At', name: stop.name, eta: formatEtaMinutes(departure), etaVerb: 'departing' };
   }
   const etaSeconds = departure ?? arrival;
   return etaSeconds == null
-    ? { label: 'Next stop', name, eta: null }
-    : { label: 'Next stop', name, eta: formatEtaMinutes(etaSeconds), etaVerb: null };
+    ? { label: 'Next stop', name: stop.name, eta: null }
+    : { label: 'Next stop', name: stop.name, eta: formatEtaMinutes(etaSeconds), etaVerb: null };
+}
+
+function headsignFor(mode, tripId) {
+  if (!tripId) return null;
+  return tripHeadsignsByMode[mode]?.[tripId] ?? null;
 }
 
 function buildPopupContent(v, info, bearing, moving) {
   const parts = [`<strong>${MODES[v.mode]?.label ?? v.mode} route ${info.name}</strong>`, `Vehicle: ${v.id}`];
+  const headsign = headsignFor(v.mode, v.tripId);
+  if (headsign) parts.push(`To: ${headsign}`);
   if (moving) parts.push(`Heading: ${bearingToCompass(bearing)}`);
   else parts.push('Status: stationary');
-  const next = nextStopInfo(v.mode, v.tripId);
+  const next = nextStopInfo(v.mode, v.tripId, v.lat, v.lon);
   if (next) {
     if (next.eta == null) parts.push(`${next.label}: ${next.name}`);
     else if (next.etaVerb) parts.push(`${next.label}: ${next.name} (${next.etaVerb} ${next.eta})`);
@@ -676,7 +701,22 @@ async function scheduleRefresh() {
   }
 }
 
+const HEADSIGN_LOADERS = {
+  train: () => import('./data/train-trip-headsigns.json'),
+  tram: () => import('./data/tram-trip-headsigns.json'),
+  vline: () => import('./data/vline-trip-headsigns.json'),
+};
+function loadTripHeadsigns() {
+  Object.entries(HEADSIGN_LOADERS).forEach(([mode, load]) => {
+    load().then((mod) => {
+      tripHeadsignsByMode[mode] = mod.default;
+      renderMarkers();
+    });
+  });
+}
+
 initRoutePicker();
 updateToggleLabel();
 centerOnUser();
 scheduleRefresh();
+loadTripHeadsigns();

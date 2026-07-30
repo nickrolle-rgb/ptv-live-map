@@ -1,9 +1,9 @@
 import { createReadStream, writeFileSync, mkdirSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
-const [, , stopsPath, outputPath] = process.argv;
-if (!stopsPath || !outputPath) {
-  console.error('Usage: node build-stop-names.js <stops.txt> <output.json>');
+const [, , tripsPath, outputPath] = process.argv;
+if (!tripsPath || !outputPath) {
+  console.error('Usage: node build-trip-headsigns.js <trips.txt> <output.json>');
   process.exit(1);
 }
 
@@ -32,19 +32,18 @@ async function forEachRow(path, onRow) {
   }
 }
 
-let idIdx, nameIdx, latIdx, lonIdx;
+let tripIdx, headsignIdx;
 const output = {};
-await forEachRow(stopsPath, (fields, headers) => {
-  if (idIdx === undefined) {
-    idIdx = headers.indexOf('stop_id');
-    nameIdx = headers.indexOf('stop_name');
-    latIdx = headers.indexOf('stop_lat');
-    lonIdx = headers.indexOf('stop_lon');
+await forEachRow(tripsPath, (fields, headers) => {
+  if (tripIdx === undefined) {
+    tripIdx = headers.indexOf('trip_id');
+    headsignIdx = headers.indexOf('trip_headsign');
   }
-  output[fields[idIdx]] = [fields[nameIdx], Number(fields[latIdx]), Number(fields[lonIdx])];
+  const headsign = fields[headsignIdx];
+  if (headsign) output[fields[tripIdx]] = headsign;
 });
 
 mkdirSync('./src/data', { recursive: true });
 const json = JSON.stringify(output);
 writeFileSync(outputPath, json);
-console.log(`Wrote ${Object.keys(output).length} stops to ${outputPath} (${(json.length / 1024).toFixed(1)} KB)`);
+console.log(`Wrote ${Object.keys(output).length} trip headsigns to ${outputPath} (${(json.length / 1024).toFixed(1)} KB)`);
