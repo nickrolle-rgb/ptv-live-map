@@ -773,6 +773,7 @@ function renderMarkers() {
       const initialBearing = v.bearing || 0;
       marker = L.marker([v.lat, v.lon], { icon: buildVehicleIcon(v.mode, color, initialBearing, false) });
       marker._lastRealLatLng = L.latLng(v.lat, v.lon);
+      marker._lastRawLatLng = L.latLng(v.lat, v.lon);
       marker._bearing = initialBearing;
       marker._lastMovedAt = Date.now();
       marker.bindPopup(buildPopupContent(v, info, initialBearing, false));
@@ -790,16 +791,28 @@ function renderMarkers() {
       marker.setIcon(buildVehicleIcon(v.mode, color, marker._bearing, moving));
       marker.setPopupContent(buildPopupContent(v, info, marker._bearing, moving));
 
-      // While confirmed dwelling at a stop, animate to the stop's precise coordinates
-      // instead of the raw GPS ping, which otherwise jitters slightly around the
-      // platform rather than looking cleanly parked.
-      const stopInfo = nextStopInfo(v.mode, v.tripId, v.lat, v.lon, v.region);
-      const dwelling = stopInfo?.label === 'At' && stopInfo.lat != null;
-      const next = dwelling ? L.latLng(stopInfo.lat, stopInfo.lon) : rawNext;
+      // renderMarkers() also gets called from the geolocation watchPosition callback
+      // (to re-evaluate "near me" visibility as the user walks), which fires far more
+      // often than the 10s vehicle-data refresh and reuses the exact same v.lat/v.lon.
+      // Only (re)start the animation when the underlying vehicle data has actually
+      // moved — otherwise marker._lastRealLatLng has already caught up to rawNext from
+      // the previous call, producing a zero-distance "animation" that freezes the
+      // marker in place and cancels whatever was still genuinely in flight.
+      const rawChanged = !marker._lastRawLatLng || marker._lastRawLatLng.lat !== v.lat || marker._lastRawLatLng.lng !== v.lon;
+      if (rawChanged) {
+        marker._lastRawLatLng = rawNext;
 
-      const snappedPath = routeSnappedPath(v.mode, baseRouteId(v.routeId), prev.lat, prev.lng, next.lat, next.lng);
-      animateMarkerTo(marker, snappedPath || [[prev.lat, prev.lng], [next.lat, next.lng]], animationDuration);
-      marker._lastRealLatLng = next;
+        // While confirmed dwelling at a stop, animate to the stop's precise
+        // coordinates instead of the raw GPS ping, which otherwise jitters slightly
+        // around the platform rather than looking cleanly parked.
+        const stopInfo = nextStopInfo(v.mode, v.tripId, v.lat, v.lon, v.region);
+        const dwelling = stopInfo?.label === 'At' && stopInfo.lat != null;
+        const next = dwelling ? L.latLng(stopInfo.lat, stopInfo.lon) : rawNext;
+
+        const snappedPath = routeSnappedPath(v.mode, baseRouteId(v.routeId), prev.lat, prev.lng, next.lat, next.lng);
+        animateMarkerTo(marker, snappedPath || [[prev.lat, prev.lng], [next.lat, next.lng]], animationDuration);
+        marker._lastRealLatLng = next;
+      }
     }
 
     if (visible && !map.hasLayer(marker)) marker.addTo(map);
@@ -1422,6 +1435,8 @@ function boundsAroundPoint(lat, lon, radiusKm) {
 }
 
 let hasCenteredOnUser = false;
+let lastVisibilityUserLocation = null;
+const VISIBILITY_REFRESH_KM = 0.02; // ~20m — small GPS jitter shouldn't re-trigger a full render
 function centerOnUser() {
   if (!navigator.geolocation) return;
   // watchPosition (not a one-shot getCurrentPosition) so "nearest stops" stays accurate
@@ -1442,8 +1457,17 @@ function centerOnUser() {
           zIndexOffset: 1000,
         }).addTo(map);
       }
-      renderMarkers();
-      updateDiscoveryPane();
+      // renderMarkers()/updateDiscoveryPane() re-evaluate "near me" visibility and are
+      // comparatively expensive (rebuild every marker's icon/popup) — only worth doing
+      // once the user has actually moved a meaningful distance, not on every GPS tick.
+      const movedKm = lastVisibilityUserLocation
+        ? haversineKm(lastVisibilityUserLocation.lat, lastVisibilityUserLocation.lon, userLocation.lat, userLocation.lon)
+        : Infinity;
+      if (movedKm > VISIBILITY_REFRESH_KM) {
+        lastVisibilityUserLocation = userLocation;
+        renderMarkers();
+        updateDiscoveryPane();
+      }
     },
     () => {},
     { timeout: 5000, enableHighAccuracy: true }
