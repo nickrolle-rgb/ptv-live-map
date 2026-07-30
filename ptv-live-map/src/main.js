@@ -320,14 +320,14 @@ async function fetchJson(url) {
 async function refreshData() {
   const modeKeys = Object.keys(MODES);
 
-  const vehicleResults = await Promise.all(
-    modeKeys.map((mode) => fetchJson(`/api/vehicles?mode=${mode}`).then((data) => data.map((v) => ({ ...v, mode }))))
-  );
+  const [vehicleResults, alertResults, tripUpdateResults] = await Promise.all([
+    Promise.all(modeKeys.map((mode) => fetchJson(`/api/vehicles?mode=${mode}`).then((data) => data.map((v) => ({ ...v, mode }))))),
+    Promise.all(modeKeys.map((mode) => (MODES[mode].hasAlerts ? fetchJson(`/api/alerts?mode=${mode}`) : Promise.resolve([])))),
+    Promise.all(modeKeys.map((mode) => fetchJson(`/api/trip-updates?mode=${mode}`))),
+  ]);
+
   allVehicles = vehicleResults.flat();
 
-  const alertResults = await Promise.all(
-    modeKeys.map((mode) => (MODES[mode].hasAlerts ? fetchJson(`/api/alerts?mode=${mode}`) : Promise.resolve([])))
-  );
   const newAlerts = new Map();
   modeKeys.forEach((mode, i) => {
     alertResults[i].forEach((a) => {
@@ -340,9 +340,6 @@ async function refreshData() {
   });
   alertsByRoute = newAlerts;
 
-  const tripUpdateResults = await Promise.all(
-    modeKeys.map((mode) => fetchJson(`/api/trip-updates?mode=${mode}`))
-  );
   const newTripUpdates = new Map();
   modeKeys.forEach((mode, i) => {
     Object.entries(tripUpdateResults[i]).forEach(([tripId, update]) => {
@@ -355,7 +352,14 @@ async function refreshData() {
   updateRouteStatuses();
 }
 
+let lastRenderAt = null;
 function renderMarkers() {
+  const now = Date.now();
+  const animationDuration = lastRenderAt
+    ? Math.min(Math.max(now - lastRenderAt, 2000), REFRESH_INTERVAL_MS * 3)
+    : REFRESH_INTERVAL_MS;
+  lastRenderAt = now;
+
   const seen = new Set();
   const hasSelection = selectedRoutes.size > 0;
   const nearbyRouteKeys = new Set();
@@ -394,7 +398,7 @@ function renderMarkers() {
 
       marker.setIcon(buildVehicleIcon(v.mode, color, marker._bearing, moving));
       marker.setPopupContent(buildPopupContent(v, info, marker._bearing, moving));
-      animateMarkerTo(marker, prev, next, REFRESH_INTERVAL_MS);
+      animateMarkerTo(marker, prev, next, animationDuration);
       marker._lastRealLatLng = next;
     }
 
@@ -662,8 +666,17 @@ function centerOnUser() {
   );
 }
 
+async function scheduleRefresh() {
+  try {
+    await refreshData();
+  } catch (err) {
+    console.error(err);
+  } finally {
+    setTimeout(scheduleRefresh, REFRESH_INTERVAL_MS);
+  }
+}
+
 initRoutePicker();
 updateToggleLabel();
 centerOnUser();
-refreshData();
-setInterval(refreshData, REFRESH_INTERVAL_MS);
+scheduleRefresh();

@@ -1,31 +1,19 @@
-import https from 'node:https';
 import GtfsRealtimeBindings from 'gtfs-realtime-bindings';
+
+export const config = { runtime: 'edge' };
 
 const FEEDS = {
   tram: 'https://api.opendata.transport.vic.gov.au/opendata/public-transport/gtfs/realtime/v1/tram/service-alerts',
   train: 'https://api.opendata.transport.vic.gov.au/opendata/public-transport/gtfs/realtime/v1/metro/service-alerts',
 };
 
-function fetchBuffer(url, headers) {
-  return new Promise((resolve, reject) => {
-    https.get(url, { headers }, (response) => {
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        reject(new Error(`Upstream request failed with status ${response.statusCode}`));
-        response.resume();
-        return;
-      }
-      const chunks = [];
-      response.on('data', (chunk) => chunks.push(chunk));
-      response.on('end', () => resolve(Buffer.concat(chunks)));
-    }).on('error', reject);
-  });
-}
-
-export default async function handler(req, res) {
-  const mode = req.query.mode === 'train' ? 'train' : 'tram';
+export default async function handler(req) {
+  const mode = new URL(req.url).searchParams.get('mode') === 'train' ? 'train' : 'tram';
 
   try {
-    const buffer = await fetchBuffer(FEEDS[mode], { KeyID: process.env.GTFS_API_KEY });
+    const upstream = await fetch(FEEDS[mode], { headers: { KeyID: process.env.GTFS_API_KEY } });
+    if (!upstream.ok) throw new Error(`Upstream request failed with status ${upstream.status}`);
+    const buffer = await upstream.arrayBuffer();
     const feed = GtfsRealtimeBindings.transit_realtime.FeedMessage.decode(new Uint8Array(buffer));
 
     const alerts = feed.entity
@@ -38,10 +26,18 @@ export default async function handler(req, res) {
       })
       .filter((a) => a.routeIds.length > 0);
 
-    res.setHeader('Cache-Control', 's-maxage=30, stale-while-revalidate=60');
-    res.status(200).json(alerts);
+    return new Response(JSON.stringify(alerts), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        'Cache-Control': 's-maxage=30, stale-while-revalidate=60',
+      },
+    });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Failed to fetch service alerts' });
+    return new Response(JSON.stringify({ error: 'Failed to fetch service alerts' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 }
