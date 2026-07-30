@@ -533,10 +533,18 @@ function easeInOutCubic(t) {
 
 function animateMarkerTo(marker, path, duration) {
   const cumulative = [0];
+  // One bearing per segment, so the icon can turn progressively through a curve
+  // instead of snapping to a single "as the crow flies" heading for the whole hop.
+  const segmentBearings = [];
   for (let i = 1; i < path.length; i++) {
     cumulative.push(cumulative[i - 1] + haversineKm(path[i - 1][0], path[i - 1][1], path[i][0], path[i][1]));
+    segmentBearings.push(computeBearing(path[i - 1][0], path[i - 1][1], path[i][0], path[i][1]));
   }
   const total = cumulative[cumulative.length - 1];
+  // Mutate the existing SVG's rotation directly each frame rather than calling
+  // setIcon() (which would recreate the DOM element every frame) — cheap and
+  // flicker-free. May be null for a marker that isn't currently on the map.
+  const iconEl = marker.getElement()?.querySelector('svg');
   const startTime = performance.now();
   function step(now) {
     const t = Math.min((now - startTime) / duration, 1);
@@ -554,6 +562,10 @@ function animateMarkerTo(marker, path, duration) {
       const [lat2, lon2] = path[i + 1];
       lat = lat1 + (lat2 - lat1) * segT;
       lon = lon1 + (lon2 - lon1) * segT;
+
+      const bearing = segmentBearings[i];
+      marker._bearing = bearing;
+      if (iconEl) iconEl.style.transform = `rotate(${bearing}deg)`;
     }
     marker.setLatLng([lat, lon]);
     if (t < 1) marker._animFrame = requestAnimationFrame(step);
