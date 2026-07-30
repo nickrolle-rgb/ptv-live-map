@@ -404,13 +404,13 @@ function nextStopInfo(mode, tripId, vLat, vLon, region) {
   const { arrival, departure } = firstStop;
   if (distanceKm <= atMaxKm) {
     return departure == null
-      ? { label: 'At', name: stop.name, eta: null }
-      : { label: 'At', name: stop.name, eta: formatEtaMinutes(departure), etaVerb: 'departing' };
+      ? { label: 'At', name: stop.name, eta: null, lat: stop.lat, lon: stop.lon }
+      : { label: 'At', name: stop.name, eta: formatEtaMinutes(departure), etaVerb: 'departing', lat: stop.lat, lon: stop.lon };
   }
   const etaSeconds = departure ?? arrival;
   return etaSeconds == null
-    ? { label: 'Next stop', name: stop.name, eta: null }
-    : { label: 'Next stop', name: stop.name, eta: formatEtaMinutes(etaSeconds), etaVerb: null };
+    ? { label: 'Next stop', name: stop.name, eta: null, lat: stop.lat, lon: stop.lon }
+    : { label: 'Next stop', name: stop.name, eta: formatEtaMinutes(etaSeconds), etaVerb: null, lat: stop.lat, lon: stop.lon };
 }
 
 function headsignFor(mode, tripId) {
@@ -524,6 +524,13 @@ function buildUserLocationIcon() {
   return L.divIcon({ className: 'user-location-icon', html, iconSize: [14, 14], iconAnchor: [7, 7] });
 }
 
+// Ease-in-out rather than constant speed, so a vehicle visibly accelerates away from
+// a stop and decelerates into the next one instead of moving at a uniform pace for the
+// whole 10s hop.
+function easeInOutCubic(t) {
+  return t < 0.5 ? 4 * t * t * t : 1 - ((-2 * t + 2) ** 3) / 2;
+}
+
 function animateMarkerTo(marker, path, duration) {
   const cumulative = [0];
   for (let i = 1; i < path.length; i++) {
@@ -537,7 +544,7 @@ function animateMarkerTo(marker, path, duration) {
     if (total === 0) {
       [lat, lon] = path[path.length - 1];
     } else {
-      const targetKm = t * total;
+      const targetKm = easeInOutCubic(t) * total;
       let i = 0;
       while (i < cumulative.length - 2 && cumulative[i + 1] < targetKm) i++;
       const segStart = cumulative[i];
@@ -760,16 +767,24 @@ function renderMarkers() {
       markers.set(key, marker);
     } else {
       const prev = marker._lastRealLatLng;
-      const next = L.latLng(v.lat, v.lon);
-      const movedMeters = prev.distanceTo(next);
+      const rawNext = L.latLng(v.lat, v.lon);
+      const movedMeters = prev.distanceTo(rawNext);
       if (movedMeters > STATIONARY_THRESHOLD_M) {
-        marker._bearing = computeBearing(prev.lat, prev.lng, next.lat, next.lng);
+        marker._bearing = computeBearing(prev.lat, prev.lng, rawNext.lat, rawNext.lng);
         marker._lastMovedAt = Date.now();
       }
       const moving = Date.now() - marker._lastMovedAt < STATIONARY_AFTER_MS;
 
       marker.setIcon(buildVehicleIcon(v.mode, color, marker._bearing, moving));
       marker.setPopupContent(buildPopupContent(v, info, marker._bearing, moving));
+
+      // While confirmed dwelling at a stop, animate to the stop's precise coordinates
+      // instead of the raw GPS ping, which otherwise jitters slightly around the
+      // platform rather than looking cleanly parked.
+      const stopInfo = nextStopInfo(v.mode, v.tripId, v.lat, v.lon, v.region);
+      const dwelling = stopInfo?.label === 'At' && stopInfo.lat != null;
+      const next = dwelling ? L.latLng(stopInfo.lat, stopInfo.lon) : rawNext;
+
       const snappedPath = routeSnappedPath(v.mode, baseRouteId(v.routeId), prev.lat, prev.lng, next.lat, next.lng);
       animateMarkerTo(marker, snappedPath || [[prev.lat, prev.lng], [next.lat, next.lng]], animationDuration);
       marker._lastRealLatLng = next;
