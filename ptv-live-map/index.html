@@ -15,12 +15,23 @@
     </button>
     <div id="route-picker-panel">
       <div id="route-picker-header">
-        <span>Routes</span>
+        <span id="route-picker-heading">Nearby</span>
         <button id="route-picker-close" type="button" aria-label="Close">&times;</button>
       </div>
-      <input type="text" id="route-search" placeholder="Search routes" />
-      <div id="mode-tabs"></div>
-      <div id="route-list"></div>
+      <div id="panel-tabs">
+        <button type="button" class="panel-tab active" data-pane="discovery">Nearby</button>
+        <button type="button" class="panel-tab" data-pane="routes">Routes</button>
+      </div>
+      <div id="panel-viewport">
+        <div id="panel-track">
+          <div id="discovery-pane" class="panel-pane"></div>
+          <div id="routes-pane" class="panel-pane">
+            <input type="text" id="route-search" placeholder="Search routes" />
+            <div id="mode-tabs"></div>
+            <div id="route-list"></div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </div>

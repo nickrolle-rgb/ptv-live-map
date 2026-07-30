@@ -91,6 +91,47 @@ const busShapesByRoute = {};
 const selectedBusRoutes = new Set();
 let busVehicles = [];
 
+// Favourites/Recents: persisted so opening the panel doesn't always start from a blank
+// search — entries are either { kind: 'route', mode, routeId } (train/tram/vline) or
+// { kind: 'bus', routeIds, shortName, longName, region, color } (the whole
+// operator-variant group, consistent with how bus selection already groups them).
+const FAVOURITES_KEY = 'ptv-map-favourites';
+const RECENTS_KEY = 'ptv-map-recents';
+const RECENTS_LIMIT = 8;
+
+function loadEntries(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+function saveEntries(key, entries) {
+  try { localStorage.setItem(key, JSON.stringify(entries)); } catch { /* storage unavailable — favourites just won't persist */ }
+}
+function entryKey(entry) {
+  return entry.kind === 'bus' ? `bus:${entry.shortName}:${entry.region}` : `route:${entry.mode}:${entry.routeId}`;
+}
+
+let favouriteEntries = loadEntries(FAVOURITES_KEY);
+let recentEntries = loadEntries(RECENTS_KEY);
+
+function isFavourited(entry) {
+  return favouriteEntries.some((e) => entryKey(e) === entryKey(entry));
+}
+function toggleFavourite(entry) {
+  favouriteEntries = isFavourited(entry)
+    ? favouriteEntries.filter((e) => entryKey(e) !== entryKey(entry))
+    : [...favouriteEntries, entry];
+  saveEntries(FAVOURITES_KEY, favouriteEntries);
+}
+function pushRecent(entry) {
+  const key = entryKey(entry);
+  recentEntries = [entry, ...recentEntries.filter((e) => entryKey(e) !== key)].slice(0, RECENTS_LIMIT);
+  saveEntries(RECENTS_KEY, recentEntries);
+}
+
 function ensureBusTripInfo(region) {
   if (!busTripInfoByRegion[region]) {
     busTripInfoByRegion[region] = busTripInfoLoaders[region]().then((mod) => {
@@ -330,6 +371,10 @@ function formatEtaMinutes(unixSeconds) {
   return mins <= 0 ? 'due' : `${mins} min`;
 }
 
+function formatDistance(km) {
+  return km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(1)} km`;
+}
+
 // Trip-updates' predicted arrival/departure times lag reality far more than the
 // vehicle's live GPS does (testing showed most "arrival already passed" entries were
 // still several km out, still en route) — so live distance to the claimed stop, not
@@ -347,15 +392,16 @@ const STOP_SANITY_KM = {
 function nextStopInfo(mode, tripId, vLat, vLon, region) {
   if (!tripId || vLat == null || vLon == null) return null;
   const update = tripUpdatesByTrip.get(`${mode}:${tripId}`);
-  if (!update) return null;
-  const stop = resolveStop(mode, update.stopId, region);
+  const firstStop = update?.stops?.[0];
+  if (!firstStop) return null;
+  const stop = resolveStop(mode, firstStop.stopId, region);
   if (!stop) return null;
 
   const distanceKm = haversineKm(vLat, vLon, stop.lat, stop.lon);
   const { at: atMaxKm, next: nextMaxKm } = STOP_SANITY_KM[mode];
   if (distanceKm > nextMaxKm) return null;
 
-  const { arrival, departure } = update;
+  const { arrival, departure } = firstStop;
   if (distanceKm <= atMaxKm) {
     return departure == null
       ? { label: 'At', name: stop.name, eta: null }
@@ -370,6 +416,71 @@ function nextStopInfo(mode, tripId, vLat, vLon, region) {
 function headsignFor(mode, tripId) {
   if (!tripId) return null;
   return tripHeadsignsByMode[mode]?.[tripId] ?? null;
+}
+
+const DISCOVERY_MODES = ['train', 'tram', 'vline'];
+
+// Inverts tripUpdatesByTrip (keyed by trip) into a per-stop view (keyed by stop), so
+// "what's the next service at stop X" can be answered regardless of which specific
+// trip/vehicle it belongs to. Bus is excluded — its trip-updates only ever carry one
+// stop per trip (see api/trip-updates.js), and buses aren't part of the nearest-stops
+// feature (matches the app's default-hidden bus behavior).
+function buildStopDepartures() {
+  const index = new Map();
+  tripUpdatesByTrip.forEach((update, key) => {
+    const mode = key.slice(0, key.indexOf(':'));
+    if (!DISCOVERY_MODES.includes(mode) || !update.stops) return;
+    update.stops.forEach((s) => {
+      if (!s.stopId) return;
+      if (!index.has(s.stopId)) index.set(s.stopId, []);
+      index.get(s.stopId).push({ mode, routeId: update.routeId, arrival: s.arrival, departure: s.departure });
+    });
+  });
+  index.forEach((list) => list.sort((a, b) => (a.departure ?? a.arrival ?? Infinity) - (b.departure ?? b.arrival ?? Infinity)));
+  return index;
+}
+
+// Scans every known train/tram/V-Line stop (~5,100 total — trivial cost) and returns
+// the closest ones to userLocation that currently have at least one live upcoming
+// departure, sorted by walking distance.
+function computeNearestStops(limit = 8) {
+  if (!userLocation) return [];
+  const departures = buildStopDepartures();
+  // Big stations (e.g. Flinders Street) have several stop_ids — one per platform/child
+  // stop, often at near-identical coordinates — and interchange stations are listed
+  // independently in more than one mode's static export (e.g. Flinders Street appears
+  // in both train's and V/Line's stops.txt, same stop_ids, since V/Line departs from
+  // the same platforms). Group by name alone (not mode+name) so these all collapse
+  // into one entry with departures merged, rather than a same-named duplicate per
+  // mode/stop_id.
+  const byKey = new Map();
+  DISCOVERY_MODES.forEach((mode) => {
+    Object.entries(MODES[mode].stopNames).forEach(([stopId, [name, lat, lon]]) => {
+      const upcoming = departures.get(stopId);
+      if (!upcoming?.length) return;
+      const distanceKm = haversineKm(userLocation.lat, userLocation.lon, lat, lon);
+      if (!byKey.has(name)) byKey.set(name, { name, lat, lon, distanceKm, upcoming: [] });
+      const entry = byKey.get(name);
+      if (distanceKm < entry.distanceKm) { entry.lat = lat; entry.lon = lon; entry.distanceKm = distanceKm; }
+      entry.upcoming.push(...upcoming);
+    });
+  });
+  const candidates = [...byKey.values()];
+  candidates.forEach((c) => {
+    // The same physical stop_id can be pulled in once per mode whose static export
+    // lists it (see comment above), contributing the same departures array more than
+    // once — dedupe before capping to the soonest few.
+    const seen = new Set();
+    c.upcoming = c.upcoming.filter((u) => {
+      const key = `${u.mode}:${u.routeId}:${u.departure ?? u.arrival}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    c.upcoming.sort((a, b) => (a.departure ?? a.arrival ?? Infinity) - (b.departure ?? b.arrival ?? Infinity));
+    c.upcoming = c.upcoming.slice(0, 3);
+  });
+  return candidates.sort((a, b) => a.distanceKm - b.distanceKm).slice(0, limit);
 }
 
 function buildPopupContent(v, info, bearing, moving) {
@@ -687,6 +798,73 @@ const searchInput = document.getElementById('route-search');
 const closeButton = document.getElementById('route-picker-close');
 const modeTabsEl = document.getElementById('mode-tabs');
 const routeListEl = document.getElementById('route-list');
+const panelHeading = document.getElementById('route-picker-heading');
+const panelTrack = document.getElementById('panel-track');
+const panelViewport = document.getElementById('panel-viewport');
+const discoveryPaneEl = document.getElementById('discovery-pane');
+const panelTabEls = [...document.querySelectorAll('.panel-tab')];
+const PANE_LABELS = { discovery: 'Nearby', routes: 'Routes' };
+
+let activePane = 'discovery';
+let discoveryRadiusCircle = null;
+
+function switchPane(pane) {
+  activePane = pane;
+  panelTrack.style.transform = pane === 'discovery' ? 'translateX(0%)' : 'translateX(-50%)';
+  panelTabEls.forEach((tab) => tab.classList.toggle('active', tab.dataset.pane === pane));
+  panelHeading.textContent = PANE_LABELS[pane];
+
+  if (pane === 'discovery') {
+    updateDiscoveryPane();
+    if (userLocation) {
+      if (discoveryRadiusCircle) map.removeLayer(discoveryRadiusCircle);
+      discoveryRadiusCircle = L.circle([userLocation.lat, userLocation.lon], {
+        radius: 1000, color: '#2563eb', weight: 1.5, dashArray: '4 6', fillOpacity: 0.03,
+      }).addTo(map);
+    }
+  } else if (discoveryRadiusCircle) {
+    map.removeLayer(discoveryRadiusCircle);
+    discoveryRadiusCircle = null;
+  }
+}
+
+panelTabEls.forEach((tab) => tab.addEventListener('click', () => switchPane(tab.dataset.pane)));
+
+// Swipe is an enhancement on top of tab-click switching, not a replacement — tracks a
+// horizontal drag and snaps to whichever pane is nearer once released.
+(function wireSwipe() {
+  let startX = null;
+  let dragging = false;
+  let viewportWidth = 0;
+
+  panelViewport.addEventListener('touchstart', (e) => {
+    startX = e.touches[0].clientX;
+    viewportWidth = panelViewport.getBoundingClientRect().width;
+    dragging = true;
+    panelTrack.classList.add('dragging');
+  }, { passive: true });
+
+  panelViewport.addEventListener('touchmove', (e) => {
+    if (!dragging || startX == null) return;
+    const deltaX = e.touches[0].clientX - startX;
+    const basePercent = activePane === 'discovery' ? 0 : -50;
+    const dragPercent = (deltaX / viewportWidth) * 50;
+    const clamped = Math.max(-50, Math.min(0, basePercent + dragPercent));
+    panelTrack.style.transform = `translateX(${clamped}%)`;
+  }, { passive: true });
+
+  panelViewport.addEventListener('touchend', (e) => {
+    if (!dragging || startX == null) return;
+    dragging = false;
+    panelTrack.classList.remove('dragging');
+    const deltaX = (e.changedTouches[0]?.clientX ?? startX) - startX;
+    startX = null;
+    const threshold = viewportWidth * 0.2;
+    if (activePane === 'discovery' && deltaX < -threshold) switchPane('routes');
+    else if (activePane === 'routes' && deltaX > threshold) switchPane('discovery');
+    else switchPane(activePane);
+  });
+})();
 
 function updateToggleLabel() {
   const total = selectedRoutes.size + selectedBusRoutes.size;
@@ -722,6 +900,22 @@ function buildRouteRow(container, mode, routeId, info) {
   textWrap.appendChild(nameEl);
   textWrap.appendChild(statusEl);
 
+  const favEntry = { kind: 'route', mode, routeId };
+  const starEl = document.createElement('span');
+  starEl.className = 'rp-star' + (isFavourited(favEntry) ? ' favourited' : '');
+  starEl.textContent = isFavourited(favEntry) ? '★' : '☆';
+  starEl.setAttribute('role', 'button');
+  starEl.setAttribute('aria-label', 'Toggle favourite');
+  starEl.tabIndex = 0;
+  starEl.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleFavourite(favEntry);
+    renderRoutePicker();
+  });
+  starEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); toggleFavourite(favEntry); renderRoutePicker(); }
+  });
+
   const checkEl = document.createElement('span');
   checkEl.className = 'rp-check';
   checkEl.textContent = '✓';
@@ -730,6 +924,7 @@ function buildRouteRow(container, mode, routeId, info) {
 
   row.appendChild(swatch);
   row.appendChild(textWrap);
+  row.appendChild(starEl);
   row.appendChild(checkEl);
 
   function toggle() {
@@ -741,6 +936,7 @@ function buildRouteRow(container, mode, routeId, info) {
       selectedRoutes.add(routeKey);
       autoShapeKeys.delete(routeKey);
       showRouteShape(mode, routeId);
+      pushRecent(favEntry);
     }
     updateToggleLabel();
     renderMarkers();
@@ -793,6 +989,22 @@ function buildBusRouteRow(container, group) {
   textWrap.appendChild(nameEl);
   textWrap.appendChild(statusEl);
 
+  const favEntry = { kind: 'bus', routeIds, shortName, longName, region, color };
+  const starEl = document.createElement('span');
+  starEl.className = 'rp-star' + (isFavourited(favEntry) ? ' favourited' : '');
+  starEl.textContent = isFavourited(favEntry) ? '★' : '☆';
+  starEl.setAttribute('role', 'button');
+  starEl.setAttribute('aria-label', 'Toggle favourite');
+  starEl.tabIndex = 0;
+  starEl.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleFavourite(favEntry);
+    renderRoutePicker();
+  });
+  starEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); toggleFavourite(favEntry); renderRoutePicker(); }
+  });
+
   const checkEl = document.createElement('span');
   checkEl.className = 'rp-check';
   checkEl.textContent = '✓';
@@ -801,6 +1013,7 @@ function buildBusRouteRow(container, group) {
 
   row.appendChild(swatch);
   row.appendChild(textWrap);
+  row.appendChild(starEl);
   row.appendChild(checkEl);
 
   function toggle() {
@@ -809,6 +1022,7 @@ function buildBusRouteRow(container, group) {
       routeIds.forEach((id) => { selectedBusRoutes.delete(id); hideRouteShape('bus', id); });
     } else {
       routeIds.forEach((id) => { selectedBusRoutes.add(id); showBusRouteShape(id); });
+      pushRecent(favEntry);
     }
     updateToggleLabel();
     refreshBusDataNow();
@@ -932,6 +1146,22 @@ function buildRouteListSkeleton() {
   selectedGroup.appendChild(selectedRows);
   routeListEl.appendChild(selectedGroup);
 
+  // Favourites/Recent lead the Routes pane on an empty search, so reopening the panel
+  // to reselect a regular route doesn't require re-searching or re-scrolling.
+  [['favourites', 'Favourites'], ['recent', 'Recent']].forEach(([id, label]) => {
+    const groupEl = document.createElement('div');
+    groupEl.className = 'route-picker-group';
+    groupEl.dataset.group = id;
+    groupEl.style.display = 'none';
+    const heading = document.createElement('strong');
+    heading.textContent = label;
+    const rows = document.createElement('div');
+    rows.id = `${id}-rows`;
+    groupEl.appendChild(heading);
+    groupEl.appendChild(rows);
+    routeListEl.appendChild(groupEl);
+  });
+
   Object.entries(MODES).forEach(([mode, config]) => {
     const group = document.createElement('div');
     group.className = 'route-picker-group';
@@ -1013,8 +1243,39 @@ function renderSelectedSection() {
   getSelectedBusGroups().forEach((g) => buildBusRouteRow(rows, g));
 }
 
+function renderEntryRow(container, entry) {
+  if (entry.kind === 'bus') {
+    buildBusRouteRow(container, {
+      shortName: entry.shortName, longName: entry.longName, region: entry.region, color: entry.color, routeIds: entry.routeIds,
+    });
+  } else {
+    buildRouteRow(container, entry.mode, entry.routeId, routeInfo(entry.mode, entry.routeId));
+  }
+}
+
+function renderFavouritesSection() {
+  const group = routeListEl.querySelector('.route-picker-group[data-group="favourites"]');
+  const rows = document.getElementById('favourites-rows');
+  rows.innerHTML = '';
+  if (searchQuery.trim() || favouriteEntries.length === 0) { group.style.display = 'none'; return; }
+  group.style.display = '';
+  favouriteEntries.forEach((entry) => renderEntryRow(rows, entry));
+}
+
+function renderRecentSection() {
+  const group = routeListEl.querySelector('.route-picker-group[data-group="recent"]');
+  const rows = document.getElementById('recent-rows');
+  rows.innerHTML = '';
+  const filtered = recentEntries.filter((e) => !isFavourited(e));
+  if (searchQuery.trim() || filtered.length === 0) { group.style.display = 'none'; return; }
+  group.style.display = '';
+  filtered.forEach((entry) => renderEntryRow(rows, entry));
+}
+
 function renderRoutePicker() {
   renderSelectedSection();
+  renderFavouritesSection();
+  renderRecentSection();
   Object.keys(MODES).forEach((mode) => {
     const group = routeListEl.querySelector(`.route-picker-group[data-group="${mode}"]`);
     group.style.display = activeTab === 'all' || activeTab === mode ? '' : 'none';
@@ -1022,6 +1283,61 @@ function renderRoutePicker() {
   });
   renderBusSection();
   updateRouteStatuses();
+}
+
+function updateDiscoveryPane() {
+  if (!panel.classList.contains('open') || activePane !== 'discovery') return;
+  discoveryPaneEl.innerHTML = '';
+
+  if (!userLocation) {
+    const msg = document.createElement('div');
+    msg.className = 'discovery-empty';
+    msg.textContent = 'Enable location to see the nearest stops and next departures.';
+    discoveryPaneEl.appendChild(msg);
+    return;
+  }
+
+  const stops = computeNearestStops(8);
+  if (stops.length === 0) {
+    const msg = document.createElement('div');
+    msg.className = 'discovery-empty';
+    msg.textContent = 'No live departures found nearby right now.';
+    discoveryPaneEl.appendChild(msg);
+    return;
+  }
+
+  stops.forEach((stop) => {
+    const row = document.createElement('div');
+    row.className = 'discovery-stop';
+
+    const top = document.createElement('div');
+    top.className = 'discovery-stop-top';
+    const nameEl = document.createElement('span');
+    nameEl.className = 'discovery-stop-name';
+    nameEl.textContent = stop.name;
+    const distEl = document.createElement('span');
+    distEl.className = 'discovery-stop-distance';
+    distEl.textContent = formatDistance(stop.distanceKm);
+    top.appendChild(nameEl);
+    top.appendChild(distEl);
+    row.appendChild(top);
+
+    const chips = document.createElement('div');
+    chips.className = 'discovery-departures';
+    stop.upcoming.forEach((u) => {
+      const chip = document.createElement('span');
+      chip.className = 'discovery-chip';
+      const info = routeInfo(u.mode, u.routeId);
+      chip.style.background = info.color || MODES[u.mode]?.color || '#666';
+      const etaSeconds = u.departure ?? u.arrival;
+      chip.textContent = `${info.name} · ${formatEtaMinutes(etaSeconds)}`;
+      chips.appendChild(chip);
+    });
+    row.appendChild(chips);
+
+    row.addEventListener('click', () => map.setView([stop.lat, stop.lon], 17));
+    discoveryPaneEl.appendChild(row);
+  });
 }
 
 function updateRouteStatuses() {
@@ -1043,6 +1359,7 @@ function initRoutePicker() {
     panel.classList.toggle('open', open);
     toggleButton.classList.toggle('open', open);
     toggleButton.setAttribute('aria-expanded', String(open));
+    if (open && activePane === 'discovery') switchPane('discovery');
   }
   toggleButton.addEventListener('click', () => setPanelOpen(!panel.classList.contains('open')));
   closeButton.addEventListener('click', () => setPanelOpen(false));
@@ -1059,21 +1376,32 @@ function boundsAroundPoint(lat, lon, radiusKm) {
   return L.latLngBounds([lat - latDelta, lon - lonDelta], [lat + latDelta, lon + lonDelta]);
 }
 
+let hasCenteredOnUser = false;
 function centerOnUser() {
   if (!navigator.geolocation) return;
-  navigator.geolocation.getCurrentPosition(
+  // watchPosition (not a one-shot getCurrentPosition) so "nearest stops" stays accurate
+  // while actually walking around. Only the very first fix recenters/zooms the map —
+  // later updates just move the dot, so the view doesn't jump around as GPS refines.
+  navigator.geolocation.watchPosition(
     (position) => {
       userLocation = { lat: position.coords.latitude, lon: position.coords.longitude };
-      map.fitBounds(boundsAroundPoint(userLocation.lat, userLocation.lon, LOCAL_RADIUS_KM));
-      if (userLocationMarker) map.removeLayer(userLocationMarker);
-      userLocationMarker = L.marker([userLocation.lat, userLocation.lon], {
-        icon: buildUserLocationIcon(),
-        zIndexOffset: 1000,
-      }).addTo(map);
+      if (!hasCenteredOnUser) {
+        hasCenteredOnUser = true;
+        map.fitBounds(boundsAroundPoint(userLocation.lat, userLocation.lon, LOCAL_RADIUS_KM));
+      }
+      if (userLocationMarker) {
+        userLocationMarker.setLatLng([userLocation.lat, userLocation.lon]);
+      } else {
+        userLocationMarker = L.marker([userLocation.lat, userLocation.lon], {
+          icon: buildUserLocationIcon(),
+          zIndexOffset: 1000,
+        }).addTo(map);
+      }
       renderMarkers();
+      updateDiscoveryPane();
     },
     () => {},
-    { timeout: 5000 }
+    { timeout: 5000, enableHighAccuracy: true }
   );
 }
 
@@ -1083,6 +1411,7 @@ async function scheduleRefresh() {
     composeVehicles();
     renderMarkers();
     updateRouteStatuses();
+    updateDiscoveryPane();
   } catch (err) {
     console.error(err);
   } finally {

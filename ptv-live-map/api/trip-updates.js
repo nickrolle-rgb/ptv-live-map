@@ -19,16 +19,24 @@ export default async function handler(req) {
     const buffer = await upstream.arrayBuffer();
     const feed = GtfsRealtimeBindings.transit_realtime.FeedMessage.decode(new Uint8Array(buffer));
 
+    // Keep several upcoming stops per trip (not just the immediate one) so a
+    // stop-centric "nearest stops" view can be built client-side. Bus stays capped at
+    // 1 — its trip-updates are already fetched live per searched route and this data
+    // isn't used for buses, so there's no reason to pay the extra payload size.
+    const stopsPerTrip = mode === 'bus' ? 1 : 4;
     const updates = {};
     feed.entity.forEach((entity) => {
       const tu = entity.tripUpdate;
       const tripId = tu?.trip?.tripId;
-      const stu = tu?.stopTimeUpdate?.[0];
-      if (!tripId || !stu) return;
+      const stus = tu?.stopTimeUpdate?.slice(0, stopsPerTrip);
+      if (!tripId || !stus?.length) return;
       updates[tripId] = {
-        stopId: stu.stopId ?? null,
-        arrival: stu.arrival?.time != null ? Number(stu.arrival.time) : null,
-        departure: stu.departure?.time != null ? Number(stu.departure.time) : null,
+        routeId: tu.trip?.routeId ?? null,
+        stops: stus.map((stu) => ({
+          stopId: stu.stopId ?? null,
+          arrival: stu.arrival?.time != null ? Number(stu.arrival.time) : null,
+          departure: stu.departure?.time != null ? Number(stu.departure.time) : null,
+        })),
       };
     });
 
