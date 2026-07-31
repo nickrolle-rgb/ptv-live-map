@@ -23,6 +23,14 @@ export function walkingMinutesTo(lat1, lon1, lat2, lon2) {
   return ((straightKm * WALK_CIRCUITY) / WALK_SPEED_KMH) * 60;
 }
 
+// Some GTFS stops.txt exports include internal wayfinding nodes at complex stations
+// (lift/stair access points, concourse "decision points") alongside real boarding
+// stops — not something a rider would ever board a service at. Best-effort filter
+// based on patterns actually observed in this app's stop data, not exhaustive; these
+// entries never appear as a real stop_id in live trip-updates either, so excluding
+// them here can't affect journey-matching accuracy (Phase 3), only display clutter.
+const NON_BOARDING_STOP_PATTERN = /decision point|\bdp\s?\d+\b|\blift\b|\bconcourse\b/i;
+
 // stopTables: [{ mode, stopNames }], stopNames shaped stopId -> [name, lat, lon] (the
 // same tables MODES[mode].stopNames already provides in main.js) — passed in rather
 // than imported so this module has no dependency on main.js's app state.
@@ -38,17 +46,24 @@ export function walkingMinutesTo(lat1, lon1, lat2, lon2) {
 // regardless of distance, but flags withinCap: false so a caller never presents that
 // longer walk as if it fit the cap (Principle 1 — honesty over confidence — applied to
 // a derived estimate, not just a live field).
+// Each returned stop also carries `stopIds` — every underlying stop_id that shares its
+// name (a station can have one per platform/child stop). Phase 1 itself never needed
+// these, but Phase 3's live journey matching does: trip-updates references specific
+// stop_ids, not names, so matching a walkable "stop" against what a live trip actually
+// reports requires this set.
 export function findWalkableStops(lat, lon, stopTables, { capMinutes = DEFAULT_WALK_CAP_MINUTES } = {}) {
   const byName = new Map();
   stopTables.forEach(({ mode, stopNames }) => {
     Object.entries(stopNames).forEach(([stopId, [name, stopLat, stopLon]]) => {
+      if (NON_BOARDING_STOP_PATTERN.test(name)) return;
       const minutes = walkingMinutesTo(lat, lon, stopLat, stopLon);
       const existing = byName.get(name);
       if (!existing) {
-        byName.set(name, { name, lat: stopLat, lon: stopLon, minutes, modes: new Set([mode]) });
+        byName.set(name, { name, lat: stopLat, lon: stopLon, minutes, modes: new Set([mode]), stopIds: new Set([stopId]) });
         return;
       }
       existing.modes.add(mode);
+      existing.stopIds.add(stopId);
       if (minutes < existing.minutes) {
         existing.lat = stopLat;
         existing.lon = stopLon;
@@ -58,7 +73,7 @@ export function findWalkableStops(lat, lon, stopTables, { capMinutes = DEFAULT_W
   });
 
   const all = [...byName.values()]
-    .map((entry) => ({ ...entry, modes: [...entry.modes] }))
+    .map((entry) => ({ ...entry, modes: [...entry.modes], stopIds: [...entry.stopIds] }))
     .sort((a, b) => a.minutes - b.minutes);
 
   const withinCap = all.filter((stop) => stop.minutes <= capMinutes);

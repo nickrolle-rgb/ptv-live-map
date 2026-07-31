@@ -482,6 +482,142 @@ function journeyStopIndex() {
   return journeyStopIndexCache;
 }
 
+// Journey planning Phase 3: live-first journey matching. Answers "what's actually
+// running right now that gets me from A toward B" using only data already being
+// fetched — no static schedule exists in this app (see PRINCIPLES.md's roadmap), so
+// this is deliberately real-time-only: it can't see a service that hasn't started
+// reporting live position yet, and one-transfer discovery is bounded by however many
+// stops ahead trip-updates currently keeps per trip (api/trip-updates.js's
+// stopsPerTrip, 4 for non-bus). Both limits are surfaced in the UI, not hidden.
+
+// A realistic minimum to physically make a transfer (walk across a platform, etc.) —
+// not a real per-station number (no data exists for that), just a sanity floor so a
+// 10-second "connection" isn't suggested as if it were walkable.
+const MIN_TRANSFER_SEC = 120;
+const MAX_JOURNEY_OPTIONS = 5;
+
+// stopId -> [{ mode, tripId, routeId, stopIndex, stops, arrival, departure }] — every
+// (currently live) trip's stops, indexed by stop, built once per search rather than
+// rescanning all trips for every candidate stop.
+function buildLiveStopIndex() {
+  const index = new Map();
+  tripUpdatesByTrip.forEach((update, key) => {
+    const sep = key.indexOf(':');
+    const mode = key.slice(0, sep);
+    if (mode === 'bus') return; // excluded — see Phase 0 scoping notes
+    const tripId = key.slice(sep + 1);
+    (update.stops ?? []).forEach((s, stopIndex) => {
+      if (!s.stopId) return;
+      if (!index.has(s.stopId)) index.set(s.stopId, []);
+      index.get(s.stopId).push({ mode, tripId, routeId: update.routeId, stopIndex, stops: update.stops, arrival: s.arrival, departure: s.departure });
+    });
+  });
+  return index;
+}
+
+// Flattens a findWalkableStops() result into stopId -> { name, minutes } — the walk
+// time to whichever named stop that stop_id belongs to.
+function collectCandidateStopIds(walkResult) {
+  const map = new Map();
+  walkResult.stops.forEach((stop) => {
+    stop.stopIds.forEach((stopId) => {
+      const existing = map.get(stopId);
+      if (!existing || stop.minutes < existing.minutes) map.set(stopId, { name: stop.name, minutes: stop.minutes });
+    });
+  });
+  return map;
+}
+
+// Keeps only the fastest option per distinct journey (same boarding trip, and same
+// transfer trip if any) — the search below can otherwise find the same physical
+// journey more than once (e.g. a trip matches two nearby candidate platforms).
+function addJourneyOption(best, option) {
+  const signature = option.transfer
+    ? `${option.mode}:${option.tripId}>${option.transfer.mode}:${option.transfer.tripId}`
+    : `${option.mode}:${option.tripId}`;
+  const existing = best.get(signature);
+  if (!existing || option.totalMinutes < existing.totalMinutes) best.set(signature, option);
+}
+
+// The core Phase 3 search. Not run automatically on every render (see renderJourneyPanel)
+// — it's a real, if bounded, scan of every currently-live trip, deliberately triggered
+// rather than recomputed on every geolocation tick.
+function findLiveJourneys(origin, destination, { capMinutes = DEFAULT_WALK_CAP_MINUTES } = {}) {
+  if (!origin || !destination) return { options: [], originWalk: null, destWalk: null };
+
+  const stopTables = journeyStopTables();
+  const originWalk = findWalkableStops(origin.lat, origin.lon, stopTables, { capMinutes });
+  const destWalk = findWalkableStops(destination.lat, destination.lon, stopTables, { capMinutes });
+  const originStopIds = collectCandidateStopIds(originWalk);
+  const destStopIds = collectCandidateStopIds(destWalk);
+
+  const stopIndex = buildLiveStopIndex();
+  const nowSec = Date.now() / 1000;
+  const best = new Map();
+
+  originStopIds.forEach((originInfo, originStopId) => {
+    (stopIndex.get(originStopId) ?? []).forEach(({ mode, tripId, routeId, stopIndex: boardIdx, stops }) => {
+      const boardStop = stops[boardIdx];
+      const boardTime = boardStop.departure ?? boardStop.arrival;
+      if (boardTime == null) return;
+      const minutesUntilBoard = (boardTime - nowSec) / 60;
+      // Must be a future departure, and reachable on foot before it leaves.
+      if (minutesUntilBoard < 0 || originInfo.minutes > minutesUntilBoard) return;
+
+      for (let j = boardIdx + 1; j < stops.length; j++) {
+        const laterStopId = stops[j].stopId;
+        const arriveTime = stops[j].arrival ?? stops[j].departure;
+        if (arriveTime == null) continue;
+
+        // Zero-transfer: this same trip reaches a destination candidate later on.
+        const destInfo = destStopIds.get(laterStopId);
+        if (destInfo) {
+          addJourneyOption(best, {
+            mode, routeId, tripId,
+            originStopName: originInfo.name, originWalkMinutes: originInfo.minutes, minutesUntilBoard,
+            transfer: null,
+            destStopName: destInfo.name, destWalkMinutes: destInfo.minutes,
+            totalMinutes: (arriveTime - nowSec) / 60 + destInfo.minutes,
+          });
+        }
+
+        // One-transfer: anything else departing from this same later stop, reaching a
+        // destination candidate on its own remaining (up to 4) stops.
+        (stopIndex.get(laterStopId) ?? []).forEach((t) => {
+          if (t.tripId === tripId && t.mode === mode) return; // same trip, not a transfer
+          const board2 = t.stops[t.stopIndex];
+          const board2Time = board2.departure ?? board2.arrival;
+          if (board2Time == null || board2Time - arriveTime < MIN_TRANSFER_SEC) return;
+
+          for (let k = t.stopIndex + 1; k < t.stops.length; k++) {
+            const alight2StopId = t.stops[k].stopId;
+            const dest2Info = destStopIds.get(alight2StopId);
+            if (!dest2Info) continue;
+            const alight2Time = t.stops[k].arrival ?? t.stops[k].departure;
+            if (alight2Time == null) continue;
+            const transferStop = resolveStop(mode, laterStopId, undefined);
+            addJourneyOption(best, {
+              mode, routeId, tripId,
+              originStopName: originInfo.name, originWalkMinutes: originInfo.minutes, minutesUntilBoard,
+              transfer: {
+                mode: t.mode, routeId: t.routeId, tripId: t.tripId,
+                stopName: transferStop?.name ?? 'transfer stop',
+                arriveMinutes: (arriveTime - nowSec) / 60,
+                departMinutes: (board2Time - nowSec) / 60,
+              },
+              destStopName: dest2Info.name, destWalkMinutes: dest2Info.minutes,
+              totalMinutes: (alight2Time - nowSec) / 60 + dest2Info.minutes,
+            });
+          }
+        });
+      }
+    });
+  });
+
+  const options = [...best.values()].sort((a, b) => a.totalMinutes - b.totalMinutes).slice(0, MAX_JOURNEY_OPTIONS);
+  return { options, originWalk, destWalk };
+}
+
 // Inverts tripUpdatesByTrip (keyed by trip) into a per-stop view (keyed by stop), so
 // "what's the next service at stop X" can be answered regardless of which specific
 // trip/vehicle it belongs to. Bus is excluded — its trip-updates only ever carry one
@@ -1698,24 +1834,23 @@ function journeyResultRow(text, onClick) {
   return row;
 }
 
-function renderJourneyWalkSection(label, point) {
+function renderJourneyWalkSection(label, walkResult) {
   journeyResultsEl.appendChild(journeySectionLabel(label));
 
-  if (!point) {
+  if (!walkResult) {
     journeyResultsEl.appendChild(journeyEmptyMsg('Enable location to see this.'));
     return;
   }
-  const result = findWalkableStops(point.lat, point.lon, journeyStopTables(), { capMinutes: DEFAULT_WALK_CAP_MINUTES });
-  if (!result.withinCap) {
+  if (!walkResult.withinCap) {
     const warn = document.createElement('div');
     warn.className = 'journey-cap-warning';
-    const nearest = result.stops[0];
+    const nearest = walkResult.stops[0];
     warn.textContent = nearest
       ? `No stop within ${DEFAULT_WALK_CAP_MINUTES} min walk — nearest is ~${Math.round(nearest.minutes)} min away.`
       : 'No known stop nearby at all.';
     journeyResultsEl.appendChild(warn);
   }
-  result.stops.slice(0, 6).forEach((stop) => {
+  walkResult.stops.slice(0, 6).forEach((stop) => {
     const row = document.createElement('div');
     row.className = 'journey-walk-stop';
     const nameEl = document.createElement('span');
@@ -1727,6 +1862,63 @@ function renderJourneyWalkSection(label, point) {
     row.appendChild(minsEl);
     journeyResultsEl.appendChild(row);
   });
+}
+
+// Deliberately blunt about what this can't see — a live-only search has real, specific
+// blind spots (see findLiveJourneys), and pretending otherwise would be exactly the
+// false-confidence Principle 1 exists to rule out.
+const JOURNEY_CAVEAT = "Live options only — a service that hasn't started reporting "
+  + "position yet won't show here, and a transfer more than a few stops further down a "
+  + "route can be missed. Bus isn't included yet.";
+
+function formatMinutesFromNow(minutes) {
+  const rounded = Math.round(minutes);
+  return rounded <= 0 ? 'now' : `in ${rounded} min`;
+}
+
+function renderJourneyOptionLeg(mode, routeId, tripId, text) {
+  const info = routeInfo(mode, routeId);
+  const leg = document.createElement('div');
+  leg.className = 'journey-option-leg';
+  const swatch = document.createElement('span');
+  swatch.className = 'journey-option-swatch';
+  swatch.style.background = info.color || MODES[mode]?.color || '#666';
+  const label = document.createElement('span');
+  label.textContent = text;
+  leg.appendChild(swatch);
+  leg.appendChild(label);
+  return leg;
+}
+
+function renderJourneyOption(option) {
+  const card = document.createElement('div');
+  card.className = 'journey-option';
+
+  const info = routeInfo(option.mode, option.routeId);
+  const modeLabel = MODES[option.mode]?.label ?? option.mode;
+  const headsign = headsignFor(option.mode, option.tripId);
+  card.appendChild(renderJourneyOptionLeg(
+    option.mode, option.routeId, option.tripId,
+    `${modeLabel} ${info.name}${headsign ? ` to ${headsign}` : ''} — board at ${option.originStopName} ${formatMinutesFromNow(option.minutesUntilBoard)}`,
+  ));
+
+  if (option.transfer) {
+    const tInfo = routeInfo(option.transfer.mode, option.transfer.routeId);
+    const tModeLabel = MODES[option.transfer.mode]?.label ?? option.transfer.mode;
+    const tHeadsign = headsignFor(option.transfer.mode, option.transfer.tripId);
+    const waitMinutes = Math.max(0, Math.round(option.transfer.departMinutes - option.transfer.arriveMinutes));
+    card.appendChild(renderJourneyOptionLeg(
+      option.transfer.mode, option.transfer.routeId, option.transfer.tripId,
+      `Change at ${option.transfer.stopName} (${waitMinutes} min wait), then ${tModeLabel} ${tInfo.name}${tHeadsign ? ` to ${tHeadsign}` : ''}`,
+    ));
+  }
+
+  const summary = document.createElement('div');
+  summary.className = 'journey-option-summary';
+  summary.textContent = `${Math.round(option.destWalkMinutes)} min walk to ${option.destStopName} — total ≈ ${Math.round(option.totalMinutes)} min`;
+  card.appendChild(summary);
+
+  return card;
 }
 
 function renderJourneyPanel() {
@@ -1781,8 +1973,27 @@ function renderJourneyPanel() {
   destHeader.querySelector('.journey-clear-dest').addEventListener('click', () => setJourneyDestination(null));
   journeyResultsEl.appendChild(destHeader);
 
-  renderJourneyWalkSection('Stops near your start', userLocation);
-  renderJourneyWalkSection('Stops near your destination', journeyDestination);
+  if (!userLocation) {
+    journeyResultsEl.appendChild(journeyEmptyMsg('Enable location to find journeys.'));
+    renderJourneyWalkSection('Stops near your destination', findWalkableStops(journeyDestination.lat, journeyDestination.lon, journeyStopTables(), { capMinutes: DEFAULT_WALK_CAP_MINUTES }));
+    return;
+  }
+
+  const { options, originWalk, destWalk } = findLiveJourneys(userLocation, journeyDestination);
+
+  const caveat = document.createElement('div');
+  caveat.className = 'journey-caveat';
+  caveat.textContent = JOURNEY_CAVEAT;
+  journeyResultsEl.appendChild(caveat);
+
+  if (options.length > 0) {
+    options.forEach((option) => journeyResultsEl.appendChild(renderJourneyOption(option)));
+  } else {
+    journeyResultsEl.appendChild(journeyEmptyMsg("No live journey found right now. A service might still be coming that this can't see yet — try again shortly."));
+  }
+
+  renderJourneyWalkSection('Stops near your start', originWalk);
+  renderJourneyWalkSection('Stops near your destination', destWalk);
 }
 
 function initJourneyPanel() {
@@ -1942,6 +2153,7 @@ async function scheduleRefresh() {
     renderMarkers();
     updateRouteStatuses();
     updateDiscoveryPane();
+    renderJourneyPanel();
   } catch (err) {
     console.error(err);
   } finally {
