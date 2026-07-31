@@ -1,6 +1,7 @@
 import './style.css';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
+import { haversineKm } from './geo.js';
 import trainRouteNames from './data/train-routes.json';
 import tramRouteNames from './data/tram-routes.json';
 import vlineRouteNames from './data/vline-routes.json';
@@ -230,15 +231,6 @@ function routeStatus(mode, routeId) {
   if (alertText) return alertText;
   if (hasActiveReplacement(mode, routeId)) return 'Bus replacement';
   return '';
-}
-
-function haversineKm(lat1, lon1, lat2, lon2) {
-  const R = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLon = ((lon2 - lon1) * Math.PI) / 180;
-  const a = Math.sin(dLat / 2) ** 2 +
-    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
 // Route-snapped animation: rather than a straight GPS-to-GPS lerp (which visibly cuts
