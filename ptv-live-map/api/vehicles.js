@@ -45,6 +45,7 @@ export default async function handler(req) {
           occupancyStatus: v.occupancyStatus ?? null,
           stopId: v.stopId ?? null,
           currentStatus: v.currentStatus ?? null,
+          timestamp: v.timestamp != null ? Number(v.timestamp) : null,
         };
       });
 

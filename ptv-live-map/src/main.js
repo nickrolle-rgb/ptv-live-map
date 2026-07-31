@@ -26,7 +26,16 @@ const LOCAL_RADIUS_KM = 1;
 const REFRESH_INTERVAL_MS = 10000;
 const STATIONARY_THRESHOLD_M = 15;
 const STATIONARY_AFTER_MS = 25000;
-const TICK_LENGTH_M = 18;
+// Bigger than the vehicle icon's own circle (VEHICLE_ICON_SIZE * 0.42 ≈ 7.5px) so an
+// occupied stop reads as a landing pad the vehicle icon is parked inside, not just a
+// bigger dot competing with it. Also used for train/V-Line's resting (unoccupied) stop
+// circles, so a station already looks like a landing pad rather than growing into one.
+const STOP_OCCUPIED_RADIUS_PX = 11;
+// Real GPS fixes land every 20-60s+ in normal operation (see renderMarkers comment
+// below) — beyond this, the feed itself hasn't heard from the vehicle in a while, so
+// its plotted position is a guess rather than a live report and the popup says so
+// instead of presenting it with false confidence.
+const STALE_POSITION_MS = 3 * 60 * 1000;
 
 const MODES = {
   tram: { label: 'Trams', color: '#6b46c1', names: tramRouteNames, hasAlerts: true, shapes: tramShapes, stops: tramStops, stopNames: tramStopNames },
@@ -74,6 +83,16 @@ let searchQuery = '';
 let activeTab = 'all';
 const routeShapeLayers = new Map();
 const autoShapeKeys = new Set();
+// key -> L.circleMarker. The static hollow stop circles drawn in showRouteShape (for
+// train/V-Line only) and the "occupied" ring here are deliberately independent: they
+// come from two different per-stop datasets (MODES[mode].stops, built from one
+// representative trip's stop_times, vs. MODES[mode].stopNames, resolved per-trip at
+// runtime) that can legitimately disagree by tens of meters at multi-platform stations
+// — trying to match one to the other by proximity intermittently lit up a circle with
+// no vehicle anywhere near it. Drawing the ring fresh at the vehicle's own resolved
+// dwelling coordinate (see nextStopInfo/renderMarkers) instead guarantees it's always
+// exactly where the vehicle marker itself is, for every mode.
+const dwellingRingLayers = new Map();
 
 // Bus support state (see BUS_ROUTES above for why this is separate from MODES).
 const busShapeLoaders = import.meta.glob('./data/bus-shapes/*.json');
@@ -314,39 +333,6 @@ function computeBearing(lat1, lon1, lat2, lon2) {
   return (toDeg(Math.atan2(y, x)) + 360) % 360;
 }
 
-function offsetPoint(lat, lon, bearingDeg, distanceMeters) {
-  const R = 6371000;
-  const toRad = (d) => (d * Math.PI) / 180;
-  const toDeg = (r) => (r * 180) / Math.PI;
-  const bearingRad = toRad(bearingDeg);
-  const latRad = toRad(lat);
-  const lonRad = toRad(lon);
-  const angularDist = distanceMeters / R;
-  const newLatRad = Math.asin(
-    Math.sin(latRad) * Math.cos(angularDist) + Math.cos(latRad) * Math.sin(angularDist) * Math.cos(bearingRad)
-  );
-  const newLonRad = lonRad + Math.atan2(
-    Math.sin(bearingRad) * Math.sin(angularDist) * Math.cos(latRad),
-    Math.cos(angularDist) - Math.sin(latRad) * Math.sin(newLatRad)
-  );
-  return [toDeg(newLatRad), toDeg(newLonRad)];
-}
-
-function buildStopTicks(points) {
-  const ticks = [];
-  points.forEach(([lat, lon], i) => {
-    let bearing;
-    if (points.length === 1) bearing = 0;
-    else if (i === 0) bearing = computeBearing(lat, lon, points[1][0], points[1][1]);
-    else if (i === points.length - 1) bearing = computeBearing(points[i - 1][0], points[i - 1][1], lat, lon);
-    else bearing = computeBearing(points[i - 1][0], points[i - 1][1], points[i + 1][0], points[i + 1][1]);
-    const perpBearing = (bearing + 90) % 360;
-    const p1 = offsetPoint(lat, lon, perpBearing, TICK_LENGTH_M / 2);
-    const p2 = offsetPoint(lat, lon, (perpBearing + 180) % 360, TICK_LENGTH_M / 2);
-    ticks.push([p1, p2]);
-  });
-  return ticks;
-}
 
 const OCCUPANCY_LABELS = {
   0: 'Empty', 1: 'Many seats available', 2: 'Few seats available',
@@ -368,11 +354,20 @@ function resolveStop(mode, stopId, region) {
 function formatEtaMinutes(unixSeconds) {
   const diffMs = unixSeconds * 1000 - Date.now();
   const mins = Math.round(diffMs / 60000);
-  return mins <= 0 ? 'due' : `${mins} min`;
+  if (mins > 0) return `${mins} min`;
+  // mins === 0 is the predicted instant itself; negative means the predicted time has
+  // already passed per schedule but GPS hasn't confirmed departure yet — "now" would
+  // overstate confidence there, "soon" doesn't.
+  return mins === 0 ? 'now' : 'soon';
 }
 
 function formatDistance(km) {
   return km < 1 ? `${Math.round(km * 1000)} m` : `${km.toFixed(1)} km`;
+}
+
+function formatAge(ms) {
+  const mins = Math.floor(ms / 60000);
+  return mins < 1 ? `${Math.round(ms / 1000)}s` : `${mins}m`;
 }
 
 // Trip-updates' predicted arrival/departure times lag reality far more than the
@@ -382,35 +377,86 @@ function formatDistance(km) {
 // all. Bounds are generous single-hop distances per mode (tram stops are close
 // together; V/Line stops can be tens of km apart), tighter for "At" since that implies
 // the vehicle is physically there right now.
+// "at" must mean "physically there right now" — it drives not just the popup's "At: X"
+// text but also whether the marker visually snaps onto the stop and its landing-pad
+// ring lights up. 0.6km (the original bound, sized for the "next" distance calc, not
+// this) was loose enough that a train still hundreds of metres out could be labelled
+// "At: Station" with nothing to visually back that up. Tightened to roughly platform
+// length plus GPS slop per mode; "next" (a different, coarser sanity check for
+// picking a plausible upcoming stop at all) is unchanged.
 const STOP_SANITY_KM = {
-  tram: { at: 0.6, next: 3 },
-  train: { at: 0.6, next: 10 },
-  vline: { at: 1, next: 60 },
-  bus: { at: 0.6, next: 5 },
+  tram: { at: 0.15, next: 3 },
+  train: { at: 0.25, next: 10 },
+  vline: { at: 0.35, next: 60 },
+  bus: { at: 0.15, next: 5 },
 };
 
+// trip-updates and vehicle-positions are two independently-polled feeds, joined only
+// by tripId — trip-updates can lag behind and still list a stop the vehicle's live GPS
+// shows it has already passed (observed: a train's raw position at one station while
+// trip-updates still named an earlier one as current/next). Rather than always
+// trusting the feed's first remaining stop, score every stop kept for this trip (see
+// stopsPerTrip in api/trip-updates.js) by live distance and take the closest one within
+// sanity range — this self-corrects as soon as the true current/next stop is anywhere
+// in that short lookahead list, instead of surfacing a stale station name.
 function nextStopInfo(mode, tripId, vLat, vLon, region) {
   if (!tripId || vLat == null || vLon == null) return null;
   const update = tripUpdatesByTrip.get(`${mode}:${tripId}`);
-  const firstStop = update?.stops?.[0];
-  if (!firstStop) return null;
-  const stop = resolveStop(mode, firstStop.stopId, region);
-  if (!stop) return null;
-
-  const distanceKm = haversineKm(vLat, vLon, stop.lat, stop.lon);
   const { at: atMaxKm, next: nextMaxKm } = STOP_SANITY_KM[mode];
-  if (distanceKm > nextMaxKm) return null;
 
-  const { arrival, departure } = firstStop;
+  let best = null;
+  for (const stopUpdate of update?.stops ?? []) {
+    const stop = resolveStop(mode, stopUpdate.stopId, region);
+    if (!stop) continue;
+    const distanceKm = haversineKm(vLat, vLon, stop.lat, stop.lon);
+    if (distanceKm > nextMaxKm) continue;
+    if (!best || distanceKm < best.distanceKm) best = { stopUpdate, stop, distanceKm };
+  }
+  if (!best) return null;
+
+  const { stopUpdate, stop, distanceKm } = best;
+  const { arrival, departure } = stopUpdate;
   if (distanceKm <= atMaxKm) {
     return departure == null
-      ? { label: 'At', name: stop.name, eta: null, lat: stop.lat, lon: stop.lon }
-      : { label: 'At', name: stop.name, eta: formatEtaMinutes(departure), etaVerb: 'departing', lat: stop.lat, lon: stop.lon };
+      ? { label: 'At', name: stop.name, eta: null, lat: stop.lat, lon: stop.lon, arrival, departure }
+      : { label: 'At', name: stop.name, eta: formatEtaMinutes(departure), etaVerb: 'departing', lat: stop.lat, lon: stop.lon, arrival, departure };
   }
   const etaSeconds = departure ?? arrival;
   return etaSeconds == null
-    ? { label: 'Next stop', name: stop.name, eta: null, lat: stop.lat, lon: stop.lon }
-    : { label: 'Next stop', name: stop.name, eta: formatEtaMinutes(etaSeconds), etaVerb: null, lat: stop.lat, lon: stop.lon };
+    ? { label: 'Next stop', name: stop.name, eta: null, lat: stop.lat, lon: stop.lon, arrival, departure }
+    : { label: 'Next stop', name: stop.name, eta: formatEtaMinutes(etaSeconds), etaVerb: null, lat: stop.lat, lon: stop.lon, arrival, departure };
+}
+
+// Speed a schedule-predicted hop would imply, above which we distrust the trip-updates
+// prediction for *positioning* purposes (label/ETA text can tolerate more slack than a
+// moving icon can) and fall back to plain GPS-to-GPS animation instead.
+const PREDICTIVE_SPEED_CEILING_KMH = { tram: 70, train: 120, vline: 160, bus: 100 };
+const MIN_PREDICTIVE_DURATION_MS = 3000;
+
+// Dead-reckons a vehicle's position between its last confirmed GPS fix and its
+// predicted arrival at the next stop (from trip-updates), rather than only animating
+// retroactively between two already-received GPS pings. Real fixes land every 20-60s+
+// in practice (see renderMarkers) — without this, a vehicle just sits frozen at its
+// last fix for that whole gap, which is exactly the "60 seconds / two stops behind"
+// drift observed on a walking commute. Each new GPS fix (rawChanged in renderMarkers)
+// or each updated prediction corrects the trajectory on the next render; a bad or
+// missing prediction falls back to the existing GPS-to-GPS eased hop untouched.
+function predictiveAnchors(mode, marker, stopInfo) {
+  if (!stopInfo || stopInfo.label !== 'Next stop' || stopInfo.lat == null) return null;
+  const endSec = stopInfo.arrival ?? stopInfo.departure;
+  const anchorA = marker._lastRawLatLng;
+  const startMs = marker._lastRawTimestamp;
+  if (endSec == null || !anchorA || startMs == null) return null;
+
+  const endMs = endSec * 1000;
+  const durationMs = endMs - startMs;
+  if (durationMs < MIN_PREDICTIVE_DURATION_MS) return null;
+
+  const distanceKm = haversineKm(anchorA.lat, anchorA.lng, stopInfo.lat, stopInfo.lon);
+  const impliedKmh = distanceKm / (durationMs / 3600000);
+  if (impliedKmh > (PREDICTIVE_SPEED_CEILING_KMH[mode] ?? 100)) return null;
+
+  return { startMs, endMs, fromLat: anchorA.lat, fromLon: anchorA.lng, toLat: stopInfo.lat, toLon: stopInfo.lon };
 }
 
 function headsignFor(mode, tripId) {
@@ -486,11 +532,21 @@ function computeNearestStops(limit = 8) {
 function buildPopupContent(v, info, bearing, moving) {
   const modeLabel = v.mode === 'bus' ? BUS_LABEL : (MODES[v.mode]?.label ?? v.mode);
   const parts = [`<strong>${modeLabel} route ${info.name}</strong>`, `Vehicle: ${v.id}`];
+  const status = routeStatus(v.mode, baseRouteId(v.routeId));
+  if (status) parts.push(`⚠ ${status}`);
   const headsign = v.mode === 'bus' ? v.headsign : headsignFor(v.mode, v.tripId);
   if (headsign) parts.push(`To: ${headsign}`);
   if (moving) parts.push(`Heading: ${bearingToCompass(bearing)}`);
   else parts.push('Status: stationary');
-  const next = nextStopInfo(v.mode, v.tripId, v.lat, v.lon, v.region);
+  // nextStopInfo picks the nearest matching stop to the vehicle's live GPS — but if
+  // that GPS fix itself is stale, "nearest to a stale position" can be confidently
+  // wrong (e.g. a station the vehicle has since departed, now sitting well past it
+  // with no fresher fix to prove that). Rather than assert a specific station off data
+  // we already know is too old to trust, drop the claim entirely and let the staleness
+  // line below speak for itself.
+  const positionAgeMs = v.timestamp != null ? Date.now() - v.timestamp * 1000 : null;
+  const positionStale = positionAgeMs != null && positionAgeMs > STALE_POSITION_MS;
+  const next = positionStale ? null : nextStopInfo(v.mode, v.tripId, v.lat, v.lon, v.region);
   if (next) {
     if (next.eta == null) parts.push(`${next.label}: ${next.name}`);
     else if (next.etaVerb) parts.push(`${next.label}: ${next.name} (${next.etaVerb} ${next.eta})`);
@@ -498,24 +554,39 @@ function buildPopupContent(v, info, bearing, moving) {
   }
   const occupancy = occupancyLabel(v.occupancyStatus);
   if (occupancy) parts.push(`Crowding: ${occupancy}`);
+  if (positionStale) parts.push(`Position may be outdated (last update ${formatAge(positionAgeMs)} ago)`);
   return parts.join('<br>');
 }
 
-const MODE_SHAPES = {
-  tram: { type: 'polygon', points: '8,2 14,12 8,7 2,12' },
-  train: { type: 'polygon', points: '8,2 14,12 2,12' },
-  vline: { type: 'chevron', points: '3,10 8,3 13,10' },
-  bus: { type: 'polygon', points: '4,2 12,2 14,7 12,12 4,12 2,7' },
+// Glyphs drawn in a fixed 24x24 local box, white fill, centered on (12,12) — a
+// stylised badge in a circle rather than a rotating direction pointer. Polygons carry
+// a matching round stroke so corners bulge softly instead of coming to a hard point.
+// Vehicle movement is conveyed by the marker's own position animating across the map
+// (see predictiveAnchors/animateMarkerTo), not by anything in the icon itself — heading
+// is the least trustworthy data point (see PRINCIPLES.md), so it stays out of the icon
+// and lives only in the popup's "Heading: NE" text.
+const MODE_GLYPHS = {
+  tram: '<polygon points="12,4.5 19.5,17 12,12.5 4.5,17" fill="white" stroke="white" stroke-width="2.4" stroke-linejoin="round"/>',
+  train: '<polygon points="12,4.5 19.5,17 4.5,17" fill="white" stroke="white" stroke-width="2.4" stroke-linejoin="round"/>',
+  vline: '<polyline points="6,16 12,6.5 18,16" fill="none" stroke="white" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>',
+  bus: '<rect x="5.5" y="5.5" width="13" height="13" rx="4" fill="white"/>',
 };
 
-function buildVehicleIcon(mode, color, bearing, moving) {
-  const size = 16;
-  const shape = MODE_SHAPES[mode] || MODE_SHAPES.tram;
-  const bar = moving ? '' : `<rect x="4" y="12.5" width="8" height="2.5" rx="1" fill="${color}"/>`;
-  const shapeSvg = shape.type === 'chevron'
-    ? `<polyline points="${shape.points}" fill="none" stroke="${color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>`
-    : `<polygon points="${shape.points}" fill="${color}" stroke="${color}" stroke-width="1"/>`;
-  const inner = `<svg width="${size}" height="${size}" viewBox="0 0 16 16" style="transform: rotate(${bearing}deg); transform-origin: 50% 50%;">${bar}${shapeSvg}</svg>`;
+const VEHICLE_ICON_SIZE = 18;
+// Trains/V-Line read as physically bigger vehicles than a tram or bus, so they get a
+// few extra pixels rather than relying on color/glyph alone to tell them apart.
+const TRAIN_ICON_SIZE = 21;
+function buildVehicleIcon(mode, color) {
+  const size = mode === 'train' || mode === 'vline' ? TRAIN_ICON_SIZE : VEHICLE_ICON_SIZE;
+  const r = size * 0.42;
+  const cx = size / 2, cy = size / 2;
+  const glyphScale = ((r * 2) / 24) * 1.05;
+  const glyphOffset = (size - 24 * glyphScale) / 2;
+  const glyph = MODE_GLYPHS[mode] || MODE_GLYPHS.tram;
+  const inner = `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="${color}" stroke="rgba(0,0,0,0.35)" stroke-width="0.5"/>
+    <g transform="translate(${glyphOffset}, ${glyphOffset}) scale(${glyphScale})">${glyph}</g>
+  </svg>`;
   return L.divIcon({ className: 'vehicle-icon', html: inner, iconSize: [size, size], iconAnchor: [size / 2, size / 2] });
 }
 
@@ -531,7 +602,14 @@ function easeInOutCubic(t) {
   return t < 0.5 ? 4 * t * t * t : 1 - ((-2 * t + 2) ** 3) / 2;
 }
 
-function animateMarkerTo(marker, path, duration) {
+// startTimeMs/endTimeMs are wall-clock epoch millis (Date.now()-comparable), not a
+// duration relative to when this function is called — this lets the predictive path
+// (src/main.js predictiveAnchors) anchor the animation to a real GPS fix's own
+// timestamp and a predicted arrival time, and lets the frame loop keep advancing
+// correctly in real time even if it's restarted (e.g. on the next 10s poll) with the
+// same anchors, since position only ever depends on Date.now() vs these two fixed
+// points, never on when the loop itself started running.
+function animateMarkerTo(marker, path, startTimeMs, endTimeMs) {
   const cumulative = [0];
   // One bearing per segment, so the icon can turn progressively through a curve
   // instead of snapping to a single "as the crow flies" heading for the whole hop.
@@ -541,13 +619,9 @@ function animateMarkerTo(marker, path, duration) {
     segmentBearings.push(computeBearing(path[i - 1][0], path[i - 1][1], path[i][0], path[i][1]));
   }
   const total = cumulative[cumulative.length - 1];
-  // Mutate the existing SVG's rotation directly each frame rather than calling
-  // setIcon() (which would recreate the DOM element every frame) — cheap and
-  // flicker-free. May be null for a marker that isn't currently on the map.
-  const iconEl = marker.getElement()?.querySelector('svg');
-  const startTime = performance.now();
-  function step(now) {
-    const t = Math.min((now - startTime) / duration, 1);
+  function step() {
+    const span = endTimeMs - startTimeMs;
+    const t = span > 0 ? Math.min(Math.max((Date.now() - startTimeMs) / span, 0), 1) : 1;
     let lat, lon;
     if (total === 0) {
       [lat, lon] = path[path.length - 1];
@@ -563,9 +637,9 @@ function animateMarkerTo(marker, path, duration) {
       lat = lat1 + (lat2 - lat1) * segT;
       lon = lon1 + (lon2 - lon1) * segT;
 
-      const bearing = segmentBearings[i];
-      marker._bearing = bearing;
-      if (iconEl) iconEl.style.transform = `rotate(${bearing}deg)`;
+      // Bearing is still tracked (used by the popup's "Heading: NE" text) even though
+      // the icon itself no longer rotates to show it — see MODE_GLYPHS above.
+      marker._bearing = segmentBearings[i];
     }
     marker.setLatLng([lat, lon]);
     if (t < 1) marker._animFrame = requestAnimationFrame(step);
@@ -583,12 +657,30 @@ function showRouteShape(mode, routeId) {
   const pathColor = mixWith(color, { r: 0, g: 0, b: 0 }, 0.35);
   const layers = lines.map((points) => L.polyline(points, { color: pathColor, weight: 3, opacity: 0.55 }));
 
-  const stopLines = MODES[mode]?.stops?.[routeId] || [];
-  stopLines.forEach((points) => {
-    buildStopTicks(points).forEach(([p1, p2]) => {
-      layers.push(L.polyline([p1, p2], { color: pathColor, weight: 2, opacity: 0.85 }));
+  // Static hollow stops-on-the-map only make sense for train/V-Line — sparse, widely
+  // spaced stations worth showing at rest. Tram (and bus, which never had these) has
+  // stops packed too tightly for that to read as anything but clutter. Sized the same
+  // as the arriving-vehicle ring (STOP_OCCUPIED_RADIUS_PX) so a station already reads
+  // as a landing pad waiting to receive a train, rather than growing into one only once
+  // something arrives. These are pure decoration — a "this line has a station roughly
+  // here" indicator, not a reliable proxy for any given vehicle's actual resolved stop
+  // (see the note by dwellingRingLayers above); the arriving-vehicle ring is always
+  // drawn separately, directly on top.
+  if (mode !== 'tram') {
+    const stopLines = MODES[mode]?.stops?.[routeId] || [];
+    stopLines.forEach((points) => {
+      points.forEach(([lat, lon]) => {
+        layers.push(L.circleMarker([lat, lon], {
+          radius: STOP_OCCUPIED_RADIUS_PX,
+          color: pathColor,
+          weight: 2,
+          opacity: 0.9,
+          fillColor: pathColor,
+          fillOpacity: 0,
+        }));
+      });
     });
-  });
+  }
 
   const group = L.layerGroup(layers).addTo(map);
   routeShapeLayers.set(routeKey, group);
@@ -601,6 +693,38 @@ function hideRouteShape(mode, routeId) {
     map.removeLayer(group);
     routeShapeLayers.delete(routeKey);
   }
+}
+
+// Creates a ring (white fill, colored border) at a dwelling vehicle's own resolved
+// stop coordinate — same trusted "At" determination that already snaps the vehicle
+// marker there (see nextStopInfo/renderMarkers) — so the vehicle icon (rendered in
+// Leaflet's marker pane, above the vector-shape pane this ring lives in) appears
+// parked inside it. Removed the moment nothing is dwelling there. dwellingStops is
+// collected fresh each renderMarkers() pass, so a vehicle departing clears its ring on
+// the very next render. Applies to all four modes uniformly — see the note by
+// dwellingRingLayers above for why this doesn't try to reuse train/V-Line's static
+// stop circles instead.
+function updateDwellingRings(dwellingStops) {
+  const seen = new Set();
+  dwellingStops.forEach(({ key, lat, lon, color }) => {
+    seen.add(key);
+    if (!dwellingRingLayers.has(key)) {
+      const ring = L.circleMarker([lat, lon], {
+        radius: STOP_OCCUPIED_RADIUS_PX,
+        color,
+        weight: 2.5,
+        fillColor: '#fff',
+        fillOpacity: 1,
+      }).addTo(map);
+      dwellingRingLayers.set(key, ring);
+    }
+  });
+  dwellingRingLayers.forEach((ring, key) => {
+    if (!seen.has(key)) {
+      map.removeLayer(ring);
+      dwellingRingLayers.delete(key);
+    }
+  });
 }
 
 function syncNearbyRouteShapes(nearbyRouteKeys) {
@@ -744,6 +868,7 @@ function renderMarkers() {
   const seen = new Set();
   const hasSelection = selectedRoutes.size > 0;
   const nearbyRouteKeys = new Set();
+  const dwellingRingStops = [];
 
   allVehicles.forEach((v) => {
     if (v.lat == null || v.lon == null) return;
@@ -764,10 +889,12 @@ function renderMarkers() {
 
     if (!marker) {
       const initialBearing = v.bearing || 0;
-      marker = L.marker([v.lat, v.lon], { icon: buildVehicleIcon(v.mode, color, initialBearing, false) });
+      marker = L.marker([v.lat, v.lon], { icon: buildVehicleIcon(v.mode, color) });
+      marker._color = color;
       marker._lastRealLatLng = L.latLng(v.lat, v.lon);
       marker._lastRawLatLng = L.latLng(v.lat, v.lon);
       marker._lastRawUpdateAt = Date.now();
+      marker._lastRawTimestamp = v.timestamp != null ? v.timestamp * 1000 : Date.now();
       marker._bearing = initialBearing;
       marker._lastMovedAt = Date.now();
       marker.bindPopup(buildPopupContent(v, info, initialBearing, false));
@@ -780,20 +907,77 @@ function renderMarkers() {
         marker._bearing = computeBearing(prev.lat, prev.lng, rawNext.lat, rawNext.lng);
         marker._lastMovedAt = Date.now();
       }
-      const moving = Date.now() - marker._lastMovedAt < STATIONARY_AFTER_MS;
-
-      marker.setIcon(buildVehicleIcon(v.mode, color, marker._bearing, moving));
-      marker.setPopupContent(buildPopupContent(v, info, marker._bearing, moving));
 
       // renderMarkers() also gets called from the geolocation watchPosition callback
       // (to re-evaluate "near me" visibility as the user walks), which fires far more
       // often than the 10s vehicle-data refresh and reuses the exact same v.lat/v.lon.
-      // Only (re)start the animation when the underlying vehicle data has actually
-      // moved — otherwise marker._lastRealLatLng has already caught up to rawNext from
-      // the previous call, producing a zero-distance "animation" that freezes the
-      // marker in place and cancels whatever was still genuinely in flight.
+      // rawChanged tells the fallback GPS-to-GPS path apart from a no-op re-render;
+      // the predictive path stays live across these extra calls regardless, since it's
+      // schedule-anchored rather than triggered by a change in v.lat/v.lon.
       const rawChanged = !marker._lastRawLatLng || marker._lastRawLatLng.lat !== v.lat || marker._lastRawLatLng.lng !== v.lon;
+      const previousRawUpdateAt = marker._lastRawUpdateAt;
       if (rawChanged) {
+        marker._lastRawUpdateAt = Date.now();
+        marker._lastRawLatLng = rawNext;
+        marker._lastRawTimestamp = v.timestamp != null ? v.timestamp * 1000 : Date.now();
+      }
+
+      const stopInfo = nextStopInfo(v.mode, v.tripId, v.lat, v.lon, v.region);
+      // "At" (see STOP_SANITY_KM) now means "physically there right now" for both the
+      // popup text and the visual snap/ring — previously these used two different
+      // distances, so the text could confidently say "At: Station X" while the marker
+      // itself sat well outside that station's landing pad, un-ringed.
+      const dwelling = stopInfo?.label === 'At' && stopInfo.lat != null;
+      // nextStopInfo re-resolves "closest matching stop" fresh every render — with two
+      // stops close together, that pick can flip to a different-but-nearby stop between
+      // real GPS fixes, even though the marker only ever re-snaps on rawChanged (see
+      // below). Pinning the dwelling target to marker._dwellingStop, only updated when
+      // rawChanged (or on first bootstrap), keeps the ring locked to wherever the marker
+      // actually is instead of chasing every re-resolution.
+      if (dwelling) {
+        if (rawChanged || !marker._dwellingStop) marker._dwellingStop = { lat: stopInfo.lat, lon: stopInfo.lon };
+      } else {
+        marker._dwellingStop = null;
+      }
+      // A route's shape (and any train/V-Line stops on it) is shown whenever *any*
+      // vehicle on that route is nearby/selected — but that doesn't mean *this*
+      // vehicle is one of the ones currently visible as its own marker. Gating on
+      // `visible` here keeps a ring from lighting up far from where you're looking
+      // because some other, off-screen vehicle on the same route is dwelling elsewhere.
+      if (marker._dwellingStop && visible) {
+        const ringKey = `${v.mode}:${marker._dwellingStop.lat.toFixed(5)}:${marker._dwellingStop.lon.toFixed(5)}`;
+        const ringColor = mixWith(color, { r: 0, g: 0, b: 0 }, 0.35);
+        dwellingRingStops.push({ key: ringKey, lat: marker._dwellingStop.lat, lon: marker._dwellingStop.lon, color: ringColor });
+      }
+      const predictive = dwelling ? null : predictiveAnchors(v.mode, marker, stopInfo);
+      const moving = predictive ? true : dwelling ? false : (Date.now() - marker._lastMovedAt < STATIONARY_AFTER_MS);
+
+      if (color !== marker._color) {
+        marker.setIcon(buildVehicleIcon(v.mode, color));
+        marker._color = color;
+      }
+      marker.setPopupContent(buildPopupContent(v, info, marker._bearing, moving));
+
+      if (predictive) {
+        // Dead-reckon toward the predicted next stop instead of freezing at the last
+        // GPS fix — see predictiveAnchors(). Only (re)build the snapped path and
+        // restart the frame loop when the anchors actually moved, since renderMarkers()
+        // fires far more often (geolocation ticks) than the anchors themselves change.
+        const changed = marker._predStartMs !== predictive.startMs
+          || Math.abs((marker._predEndMs ?? 0) - predictive.endMs) > 2000
+          || marker._predToLat !== predictive.toLat
+          || marker._predToLon !== predictive.toLon;
+        if (changed) {
+          const snapped = routeSnappedPath(v.mode, baseRouteId(v.routeId), predictive.fromLat, predictive.fromLon, predictive.toLat, predictive.toLon);
+          const path = snapped || [[predictive.fromLat, predictive.fromLon], [predictive.toLat, predictive.toLon]];
+          animateMarkerTo(marker, path, predictive.startMs, predictive.endMs);
+          marker._predStartMs = predictive.startMs;
+          marker._predEndMs = predictive.endMs;
+          marker._predToLat = predictive.toLat;
+          marker._predToLon = predictive.toLon;
+        }
+        marker._lastRealLatLng = L.latLng(predictive.toLat, predictive.toLon);
+      } else if (rawChanged) {
         // Real vehicles update at very different, often much sparser cadences than our
         // 10s poll — measured live: every single real position change observed over a
         // 2.5-minute window had a gap of at least 20s since that vehicle's previous
@@ -804,22 +988,25 @@ function renderMarkers() {
         // past 2 stops" pattern reported. Duration is now based on how long it's
         // actually been since *this* vehicle's own last real position change, capped
         // at 90s so a very long gap doesn't turn into an oddly slow-motion glide.
-        const now = Date.now();
-        const vehicleAnimationDuration = marker._lastRawUpdateAt
-          ? Math.min(Math.max(now - marker._lastRawUpdateAt, 2000), 90000)
-          : REFRESH_INTERVAL_MS;
-        marker._lastRawUpdateAt = now;
-        marker._lastRawLatLng = rawNext;
+        const startMs = Date.now();
 
         // While confirmed dwelling at a stop, animate to the stop's precise
         // coordinates instead of the raw GPS ping, which otherwise jitters slightly
-        // around the platform rather than looking cleanly parked.
-        const stopInfo = nextStopInfo(v.mode, v.tripId, v.lat, v.lon, v.region);
-        const dwelling = stopInfo?.label === 'At' && stopInfo.lat != null;
-        const next = dwelling ? L.latLng(stopInfo.lat, stopInfo.lon) : rawNext;
+        // around the platform rather than looking cleanly parked. This is also what
+        // lights up the stop's landing-pad ring (see updateDwellingRings), and that
+        // ring lights up immediately off live GPS proximity — so the snap here uses a
+        // short fixed duration rather than the variable "time since last update" one
+        // below, otherwise a vehicle that had gone quiet for a while would visibly lag
+        // behind its own ring for up to 90s.
+        const next = dwelling ? L.latLng(marker._dwellingStop.lat, marker._dwellingStop.lon) : rawNext;
+        const vehicleAnimationDuration = dwelling
+          ? 3000
+          : previousRawUpdateAt
+            ? Math.min(Math.max(startMs - previousRawUpdateAt, 2000), 90000)
+            : REFRESH_INTERVAL_MS;
 
         const snappedPath = routeSnappedPath(v.mode, baseRouteId(v.routeId), prev.lat, prev.lng, next.lat, next.lng);
-        animateMarkerTo(marker, snappedPath || [[prev.lat, prev.lng], [next.lat, next.lng]], vehicleAnimationDuration);
+        animateMarkerTo(marker, snappedPath || [[prev.lat, prev.lng], [next.lat, next.lng]], startMs, startMs + vehicleAnimationDuration);
         marker._lastRealLatLng = next;
       }
     }
@@ -838,6 +1025,8 @@ function renderMarkers() {
 
   if (hasSelection) clearAutoRouteShapes();
   else syncNearbyRouteShapes(nearbyRouteKeys);
+
+  updateDwellingRings(dwellingRingStops);
 }
 
 const toggleButton = document.getElementById('route-picker-toggle');
@@ -1446,8 +1635,23 @@ function boundsAroundPoint(lat, lon, radiusKm) {
 let hasCenteredOnUser = false;
 let lastVisibilityUserLocation = null;
 const VISIBILITY_REFRESH_KM = 0.02; // ~20m — small GPS jitter shouldn't re-trigger a full render
+
+// Vehicles shouldn't appear until the view they're plotted on is actually settled and
+// the first live fetch has landed — otherwise markers pop in on the default Melbourne
+// view and then jump when centerOnUser() re-fits to the user's real location a moment
+// later. Both flags latch true once and stay there; the overlay only ever hides once.
+let mapSettled = false;
+let dataSettled = false;
+function checkInitialLoadDone() {
+  if (mapSettled && dataSettled) document.getElementById('map-loading')?.classList.add('hidden');
+}
+
 function centerOnUser() {
-  if (!navigator.geolocation) return;
+  if (!navigator.geolocation) {
+    mapSettled = true;
+    checkInitialLoadDone();
+    return;
+  }
   // watchPosition (not a one-shot getCurrentPosition) so "nearest stops" stays accurate
   // while actually walking around. Only the very first fix recenters/zooms the map —
   // later updates just move the dot, so the view doesn't jump around as GPS refines.
@@ -1457,6 +1661,8 @@ function centerOnUser() {
       if (!hasCenteredOnUser) {
         hasCenteredOnUser = true;
         map.fitBounds(boundsAroundPoint(userLocation.lat, userLocation.lon, LOCAL_RADIUS_KM));
+        mapSettled = true;
+        checkInitialLoadDone();
       }
       if (userLocationMarker) {
         userLocationMarker.setLatLng([userLocation.lat, userLocation.lon]);
@@ -1478,7 +1684,10 @@ function centerOnUser() {
         updateDiscoveryPane();
       }
     },
-    () => {},
+    () => {
+      mapSettled = true;
+      checkInitialLoadDone();
+    },
     { timeout: 5000, enableHighAccuracy: true }
   );
 }
@@ -1493,6 +1702,8 @@ async function scheduleRefresh() {
   } catch (err) {
     console.error(err);
   } finally {
+    dataSettled = true;
+    checkInitialLoadDone();
     setTimeout(scheduleRefresh, REFRESH_INTERVAL_MS);
   }
 }
