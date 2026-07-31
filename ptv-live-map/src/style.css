@@ -194,3 +194,87 @@ body.dark-mode {
   text-decoration: underline; text-underline-offset: 2px;
 }
 .rp-select-all:hover { color: var(--text-primary); }
+
+.journey-dest-icon { background: transparent !important; border: none !important; }
+
+#journey-picker { position: relative; display: block; margin-top: 8px; }
+
+#journey-toggle {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 14px; font-size: 14px; font-weight: 500;
+  border-radius: 10px; border: 1px solid var(--panel-border);
+  background: var(--panel-bg); color: var(--text-primary);
+  cursor: pointer; box-shadow: var(--shadow);
+  transition: background 0.15s ease;
+}
+#journey-toggle:hover { background: var(--row-hover); }
+#journey-toggle:active { transform: scale(0.98); }
+#journey-chevron { font-size: 10px; color: var(--text-muted); transition: transform 0.15s ease; display: inline-block; }
+#journey-toggle.open #journey-chevron { transform: rotate(180deg); }
+
+#journey-panel {
+  position: absolute; top: 100%; left: 0; margin-top: 8px;
+  background: var(--panel-bg); color: var(--text-primary);
+  border: 1px solid var(--panel-border); border-radius: 12px;
+  box-shadow: var(--shadow); padding: 14px; width: 280px;
+  opacity: 0; transform: translateY(-6px) scale(0.98);
+  pointer-events: none; transform-origin: top left;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+#journey-panel.open { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
+
+#journey-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 12px; font-size: 12px; font-weight: 700;
+  letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted);
+}
+#journey-close {
+  background: none; border: none; cursor: pointer;
+  font-size: 18px; line-height: 1; color: var(--text-muted); padding: 2px 6px;
+  border-radius: 6px;
+}
+#journey-close:hover { background: var(--row-hover); color: var(--text-primary); }
+
+#journey-origin-row { font-size: 13px; color: var(--text-primary); margin-bottom: 10px; }
+
+#journey-search-wrap { position: relative; margin-bottom: 6px; }
+#journey-search {
+  width: 100%; box-sizing: border-box; padding: 8px 30px 8px 10px; font-size: 13px;
+  border-radius: 8px; border: 1px solid var(--panel-border);
+  background: var(--input-bg); color: var(--text-primary);
+  transition: border-color 0.15s ease;
+}
+#journey-search:focus { outline: none; border-color: #6b46c1; }
+#journey-search-clear {
+  position: absolute; top: 50%; right: 4px; transform: translateY(-50%);
+  width: 22px; height: 22px; border: none; background: none; cursor: pointer;
+  font-size: 16px; line-height: 1; color: var(--text-muted); border-radius: 50%;
+  display: none; align-items: center; justify-content: center;
+}
+#journey-search-clear:hover { background: var(--row-hover); color: var(--text-primary); }
+#journey-search-wrap.has-text #journey-search-clear { display: flex; }
+
+#journey-hint { font-size: 11px; color: var(--text-muted); margin-bottom: 10px; }
+
+#journey-results { max-height: 300px; overflow-y: auto; scrollbar-width: thin; }
+.journey-row {
+  padding: 9px 8px; border-radius: 8px; margin-bottom: 2px; cursor: pointer;
+  transition: background 0.1s ease; font-size: 13.5px; color: var(--text-primary);
+}
+.journey-row:hover { background: var(--row-hover); }
+.journey-empty { padding: 12px 8px; text-align: center; color: var(--text-muted); font-size: 13px; line-height: 1.5; }
+.journey-muted { color: var(--text-muted); }
+
+.journey-dest-header { padding: 6px 8px 4px; font-size: 13.5px; }
+
+.journey-section-label {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase;
+  color: var(--text-muted); margin: 10px 0 4px; padding: 0 8px;
+}
+.journey-walk-stop { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 4px 8px; font-size: 13px; }
+.journey-cap-warning { color: #d97706; font-size: 11.5px; padding: 4px 8px; }
+.journey-clear-dest {
+  font-size: 11px; color: var(--text-muted); cursor: pointer;
+  text-decoration: underline; text-underline-offset: 2px; margin-left: 6px;
+}
+.journey-clear-dest:hover { color: var(--text-primary); }

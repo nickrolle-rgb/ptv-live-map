@@ -2,6 +2,7 @@ import './style.css';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 import { haversineKm } from './geo.js';
+import { findWalkableStops, DEFAULT_WALK_CAP_MINUTES } from './journey.js';
 import trainRouteNames from './data/train-routes.json';
 import tramRouteNames from './data/tram-routes.json';
 import vlineRouteNames from './data/vline-routes.json';
@@ -457,6 +458,29 @@ function headsignFor(mode, tripId) {
 }
 
 const DISCOVERY_MODES = ['train', 'tram', 'vline'];
+
+// The stop tables findWalkableStops (src/journey.js) needs — passed in rather than
+// having that module import MODES directly, so it stays decoupled from main.js's app
+// state (see journey.js's own header comment).
+function journeyStopTables() {
+  return DISCOVERY_MODES.map((mode) => ({ mode, stopNames: MODES[mode].stopNames }));
+}
+
+// Flat, de-duplicated-by-name list of every train/tram/V-Line stop, for the "search a
+// destination" box in the journey panel — built once, since the underlying stop data
+// never changes at runtime.
+let journeyStopIndexCache = null;
+function journeyStopIndex() {
+  if (journeyStopIndexCache) return journeyStopIndexCache;
+  const byName = new Map();
+  journeyStopTables().forEach(({ stopNames }) => {
+    Object.values(stopNames).forEach(([name, lat, lon]) => {
+      if (!byName.has(name)) byName.set(name, { name, lat, lon });
+    });
+  });
+  journeyStopIndexCache = [...byName.values()];
+  return journeyStopIndexCache;
+}
 
 // Inverts tripUpdatesByTrip (keyed by trip) into a per-stop view (keyed by stop), so
 // "what's the next service at stop X" can be answered regardless of which specific
@@ -1037,6 +1061,15 @@ const discoveryPaneEl = document.getElementById('discovery-pane');
 const panelTabEls = [...document.querySelectorAll('.panel-tab')];
 const PANE_LABELS = { discovery: 'Nearby', routes: 'Routes' };
 
+const journeyToggleButton = document.getElementById('journey-toggle');
+const journeyPanelEl = document.getElementById('journey-panel');
+const journeyCloseButton = document.getElementById('journey-close');
+const journeyOriginRowEl = document.getElementById('journey-origin-row');
+const journeySearchInput = document.getElementById('journey-search');
+const journeySearchWrap = document.getElementById('journey-search-wrap');
+const journeySearchClearButton = document.getElementById('journey-search-clear');
+const journeyResultsEl = document.getElementById('journey-results');
+
 let activePane = 'discovery';
 let discoveryRadiusCircle = null;
 
@@ -1579,6 +1612,157 @@ function updateDiscoveryPane() {
   });
 }
 
+// Journey planning Phase 2 (v0): destination-only picking (search a stop name, or tap
+// the map) — origin is always userLocation for now, no geocoding. See the approved
+// roadmap: free-text address search is a later, separate decision (checkpoint), not
+// assumed here. Nothing here computes an actual journey yet (Phase 3) — this just
+// proves the pipeline by showing walkable stops (src/journey.js, Phase 1) near both
+// ends.
+let journeyDestination = null; // { lat, lon, label } | null
+let journeyDestMarker = null;
+let journeyQuery = '';
+
+function buildJourneyDestIcon() {
+  const html = '<svg width="26" height="34" viewBox="0 0 26 34">'
+    + '<path d="M13 0C5.8 0 0 5.8 0 13c0 9.75 13 21 13 21s13-11.25 13-21C26 5.8 20.2 0 13 0z" fill="#dc2626" stroke="#fff" stroke-width="1.5"/>'
+    + '<circle cx="13" cy="13" r="5" fill="#fff"/></svg>';
+  return L.divIcon({ className: 'journey-dest-icon', html, iconSize: [26, 34], iconAnchor: [13, 34] });
+}
+
+function setJourneyDestination(point) {
+  journeyDestination = point;
+  if (point) {
+    if (journeyDestMarker) journeyDestMarker.setLatLng([point.lat, point.lon]);
+    else journeyDestMarker = L.marker([point.lat, point.lon], { icon: buildJourneyDestIcon() }).addTo(map);
+  } else if (journeyDestMarker) {
+    map.removeLayer(journeyDestMarker);
+    journeyDestMarker = null;
+  }
+  renderJourneyPanel();
+}
+
+function journeyEmptyMsg(text) {
+  const el = document.createElement('div');
+  el.className = 'journey-empty';
+  el.textContent = text;
+  return el;
+}
+
+function renderJourneyWalkSection(label, point) {
+  const heading = document.createElement('div');
+  heading.className = 'journey-section-label';
+  heading.textContent = label;
+  journeyResultsEl.appendChild(heading);
+
+  if (!point) {
+    journeyResultsEl.appendChild(journeyEmptyMsg('Enable location to see this.'));
+    return;
+  }
+  const result = findWalkableStops(point.lat, point.lon, journeyStopTables(), { capMinutes: DEFAULT_WALK_CAP_MINUTES });
+  if (!result.withinCap) {
+    const warn = document.createElement('div');
+    warn.className = 'journey-cap-warning';
+    const nearest = result.stops[0];
+    warn.textContent = nearest
+      ? `No stop within ${DEFAULT_WALK_CAP_MINUTES} min walk — nearest is ~${Math.round(nearest.minutes)} min away.`
+      : 'No known stop nearby at all.';
+    journeyResultsEl.appendChild(warn);
+  }
+  result.stops.slice(0, 6).forEach((stop) => {
+    const row = document.createElement('div');
+    row.className = 'journey-walk-stop';
+    const nameEl = document.createElement('span');
+    nameEl.textContent = stop.name;
+    const minsEl = document.createElement('span');
+    minsEl.className = 'journey-muted';
+    minsEl.textContent = `~${Math.round(stop.minutes)} min walk`;
+    row.appendChild(nameEl);
+    row.appendChild(minsEl);
+    journeyResultsEl.appendChild(row);
+  });
+}
+
+function renderJourneyPanel() {
+  if (!journeyPanelEl.classList.contains('open')) return;
+
+  journeyOriginRowEl.innerHTML = userLocation
+    ? 'From: <strong>Your location</strong>'
+    : '<span class="journey-muted">From: enable location, or tap the map to set a destination</span>';
+
+  journeyResultsEl.innerHTML = '';
+
+  const query = journeyQuery.trim().toLowerCase();
+  if (query) {
+    const matches = journeyStopIndex().filter((s) => s.name.toLowerCase().includes(query)).slice(0, 20);
+    if (matches.length === 0) {
+      journeyResultsEl.appendChild(journeyEmptyMsg('No matching stops.'));
+      return;
+    }
+    matches.forEach((stop) => {
+      const row = document.createElement('div');
+      row.className = 'journey-row';
+      row.textContent = stop.name;
+      row.addEventListener('click', () => {
+        journeySearchInput.value = '';
+        journeyQuery = '';
+        journeySearchWrap.classList.remove('has-text');
+        setJourneyDestination({ lat: stop.lat, lon: stop.lon, label: stop.name });
+      });
+      journeyResultsEl.appendChild(row);
+    });
+    return;
+  }
+
+  if (!journeyDestination) {
+    journeyResultsEl.appendChild(journeyEmptyMsg('Search a destination stop above, or tap the map to drop a pin.'));
+    return;
+  }
+
+  const destHeader = document.createElement('div');
+  destHeader.className = 'journey-dest-header';
+  destHeader.innerHTML = `To: <strong>${journeyDestination.label}</strong><span class="journey-clear-dest">change</span>`;
+  destHeader.querySelector('.journey-clear-dest').addEventListener('click', () => setJourneyDestination(null));
+  journeyResultsEl.appendChild(destHeader);
+
+  renderJourneyWalkSection('Stops near your start', userLocation);
+  renderJourneyWalkSection('Stops near your destination', journeyDestination);
+}
+
+function initJourneyPanel() {
+  function setJourneyPanelOpen(open) {
+    journeyPanelEl.classList.toggle('open', open);
+    journeyToggleButton.classList.toggle('open', open);
+    journeyToggleButton.setAttribute('aria-expanded', String(open));
+    if (open) renderJourneyPanel();
+  }
+  journeyToggleButton.addEventListener('click', () => setJourneyPanelOpen(!journeyPanelEl.classList.contains('open')));
+  journeyCloseButton.addEventListener('click', () => setJourneyPanelOpen(false));
+
+  journeySearchInput.addEventListener('input', (e) => {
+    journeyQuery = e.target.value;
+    journeySearchWrap.classList.toggle('has-text', journeyQuery.length > 0);
+    renderJourneyPanel();
+  });
+  journeySearchClearButton.addEventListener('click', () => {
+    journeySearchInput.value = '';
+    journeyQuery = '';
+    journeySearchWrap.classList.remove('has-text');
+    renderJourneyPanel();
+    journeySearchInput.focus();
+  });
+
+  // Only picks a destination while the panel is actually open, so this never
+  // interferes with normal map interaction (vehicle popups, panning) otherwise.
+  map.on('click', (e) => {
+    if (!journeyPanelEl.classList.contains('open')) return;
+    setJourneyDestination({
+      lat: e.latlng.lat,
+      lon: e.latlng.lng,
+      label: `Dropped pin (${e.latlng.lat.toFixed(4)}, ${e.latlng.lng.toFixed(4)})`,
+    });
+  });
+}
+
 function updateRouteStatuses() {
   document.querySelectorAll('.rp-row[data-route-key]').forEach((row) => {
     const [mode, routeId] = row.dataset.routeKey.split(/:(.+)/);
@@ -1674,6 +1858,7 @@ function centerOnUser() {
         lastVisibilityUserLocation = userLocation;
         renderMarkers();
         updateDiscoveryPane();
+        renderJourneyPanel();
       }
     },
     () => {
@@ -1715,6 +1900,7 @@ function loadTripHeadsigns() {
 }
 
 initRoutePicker();
+initJourneyPanel();
 updateToggleLabel();
 centerOnUser();
 scheduleRefresh();
