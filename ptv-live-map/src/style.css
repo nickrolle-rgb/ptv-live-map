@@ -278,3 +278,4 @@ body.dark-mode {
   text-decoration: underline; text-underline-offset: 2px; margin-left: 6px;
 }
 .journey-clear-dest:hover { color: var(--text-primary); }
+.journey-attribution { font-size: 10px; color: var(--text-muted); padding: 4px 8px 2px; opacity: 0.8; }

@@ -1612,15 +1612,50 @@ function updateDiscoveryPane() {
   });
 }
 
-// Journey planning Phase 2 (v0): destination-only picking (search a stop name, or tap
-// the map) — origin is always userLocation for now, no geocoding. See the approved
-// roadmap: free-text address search is a later, separate decision (checkpoint), not
-// assumed here. Nothing here computes an actual journey yet (Phase 3) — this just
-// proves the pipeline by showing walkable stops (src/journey.js, Phase 1) near both
-// ends.
+// Journey planning Phase 2: destination-only picking (search a stop name, search a
+// free-text address via Nominatim, or tap the map) — origin is always userLocation for
+// now. Nothing here computes an actual journey yet (Phase 3) — this just proves the
+// pipeline by showing walkable stops (src/journey.js, Phase 1) near both ends.
 let journeyDestination = null; // { lat, lon, label } | null
 let journeyDestMarker = null;
 let journeyQuery = '';
+
+// Nominatim address search (api/geocode.js) — debounced well past its 1-req/sec usage
+// policy, and gated behind a 3-character minimum so it never fires on a stray keypress.
+// journeyGeocodeResults/Pending are keyed implicitly to journeyQuery: a response only
+// gets applied if journeyQuery still matches the text it was requested for, so a
+// slow/out-of-order response can't clobber what the user has since typed.
+const GEOCODE_DEBOUNCE_MS = 600;
+const GEOCODE_MIN_CHARS = 3;
+let journeyGeocodeResults = [];
+let journeyGeocodePending = false;
+let journeyGeocodeTimer = null;
+
+async function runJourneyGeocode(query) {
+  journeyGeocodePending = true;
+  renderJourneyPanel();
+  let places = [];
+  try {
+    const res = await fetch(`/api/geocode?q=${encodeURIComponent(query)}`);
+    places = res.ok ? await res.json() : [];
+  } catch (err) {
+    console.error(err);
+  }
+  if (journeyQuery.trim() !== query) return; // superseded by further typing — discard
+  journeyGeocodeResults = Array.isArray(places) ? places : [];
+  journeyGeocodePending = false;
+  renderJourneyPanel();
+}
+
+function selectJourneyDestination(point) {
+  journeySearchInput.value = '';
+  journeyQuery = '';
+  journeySearchWrap.classList.remove('has-text');
+  journeyGeocodeResults = [];
+  journeyGeocodePending = false;
+  clearTimeout(journeyGeocodeTimer);
+  setJourneyDestination(point);
+}
 
 function buildJourneyDestIcon() {
   const html = '<svg width="26" height="34" viewBox="0 0 26 34">'
@@ -1648,11 +1683,23 @@ function journeyEmptyMsg(text) {
   return el;
 }
 
+function journeySectionLabel(text) {
+  const el = document.createElement('div');
+  el.className = 'journey-section-label';
+  el.textContent = text;
+  return el;
+}
+
+function journeyResultRow(text, onClick) {
+  const row = document.createElement('div');
+  row.className = 'journey-row';
+  row.textContent = text;
+  row.addEventListener('click', onClick);
+  return row;
+}
+
 function renderJourneyWalkSection(label, point) {
-  const heading = document.createElement('div');
-  heading.className = 'journey-section-label';
-  heading.textContent = label;
-  journeyResultsEl.appendChild(heading);
+  journeyResultsEl.appendChild(journeySectionLabel(label));
 
   if (!point) {
     journeyResultsEl.appendChild(journeyEmptyMsg('Enable location to see this.'));
@@ -1693,23 +1740,33 @@ function renderJourneyPanel() {
 
   const query = journeyQuery.trim().toLowerCase();
   if (query) {
-    const matches = journeyStopIndex().filter((s) => s.name.toLowerCase().includes(query)).slice(0, 20);
-    if (matches.length === 0) {
-      journeyResultsEl.appendChild(journeyEmptyMsg('No matching stops.'));
-      return;
-    }
-    matches.forEach((stop) => {
-      const row = document.createElement('div');
-      row.className = 'journey-row';
-      row.textContent = stop.name;
-      row.addEventListener('click', () => {
-        journeySearchInput.value = '';
-        journeyQuery = '';
-        journeySearchWrap.classList.remove('has-text');
-        setJourneyDestination({ lat: stop.lat, lon: stop.lon, label: stop.name });
+    const stopMatches = journeyStopIndex().filter((s) => s.name.toLowerCase().includes(query)).slice(0, 8);
+
+    if (stopMatches.length > 0) {
+      journeyResultsEl.appendChild(journeySectionLabel('Stops'));
+      stopMatches.forEach((stop) => {
+        journeyResultsEl.appendChild(journeyResultRow(stop.name, () => selectJourneyDestination({ lat: stop.lat, lon: stop.lon, label: stop.name })));
       });
-      journeyResultsEl.appendChild(row);
-    });
+    }
+
+    if (journeyGeocodePending || journeyGeocodeResults.length > 0) {
+      journeyResultsEl.appendChild(journeySectionLabel('Addresses'));
+    }
+    if (journeyGeocodePending) {
+      journeyResultsEl.appendChild(journeyEmptyMsg('Searching addresses…'));
+    } else if (journeyGeocodeResults.length > 0) {
+      journeyGeocodeResults.forEach((place) => {
+        journeyResultsEl.appendChild(journeyResultRow(place.label, () => selectJourneyDestination({ lat: place.lat, lon: place.lon, label: place.label })));
+      });
+      const attribution = document.createElement('div');
+      attribution.className = 'journey-attribution';
+      attribution.textContent = 'Addresses via OpenStreetMap Nominatim';
+      journeyResultsEl.appendChild(attribution);
+    }
+
+    if (stopMatches.length === 0 && !journeyGeocodePending && journeyGeocodeResults.length === 0) {
+      journeyResultsEl.appendChild(journeyEmptyMsg(query.length < GEOCODE_MIN_CHARS ? 'Keep typing to search stops and addresses…' : 'No matches.'));
+    }
     return;
   }
 
@@ -1741,12 +1798,21 @@ function initJourneyPanel() {
   journeySearchInput.addEventListener('input', (e) => {
     journeyQuery = e.target.value;
     journeySearchWrap.classList.toggle('has-text', journeyQuery.length > 0);
+    clearTimeout(journeyGeocodeTimer);
+    const query = journeyQuery.trim();
+    if (query.length < GEOCODE_MIN_CHARS) journeyGeocodeResults = [];
     renderJourneyPanel();
+    if (query.length >= GEOCODE_MIN_CHARS) {
+      journeyGeocodeTimer = setTimeout(() => runJourneyGeocode(query), GEOCODE_DEBOUNCE_MS);
+    }
   });
   journeySearchClearButton.addEventListener('click', () => {
     journeySearchInput.value = '';
     journeyQuery = '';
     journeySearchWrap.classList.remove('has-text');
+    journeyGeocodeResults = [];
+    journeyGeocodePending = false;
+    clearTimeout(journeyGeocodeTimer);
     renderJourneyPanel();
     journeySearchInput.focus();
   });
