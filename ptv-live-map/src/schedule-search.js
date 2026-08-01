@@ -209,7 +209,12 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
   connections.sort((a, b) => a.depTime - b.depTime);
 
   const earliestArrival = new Map(); // stopId -> absSeconds
-  const predecessor = new Map(); // stopId -> { tripId, routeId, mode, fromStopId, depTime, arrTime, fromSeq, toSeq }
+  // stopId -> hop, where a hop is an immutable snapshot: { ..., prevHop: <hop for
+  // fromStopId at the moment this hop was created, or null>. Capturing prevHop by
+  // reference (not re-resolving fromStopId through this Map later) matters — see the
+  // long comment at the backtrack site below for why a naive "look fromStopId up in this
+  // Map when reconstructing" approach can produce an unfollowable cycle.
+  const predecessor = new Map();
   const inTrip = new Set(); // tripId currently boarded/continuing
 
   originWalk.stops.forEach((stop) => {
@@ -238,7 +243,8 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
     earliestArrival.set(c.toStopId, c.arrTime);
     predecessor.set(c.toStopId, {
       tripId: c.tripId, routeId: c.routeId, mode: c.mode,
-      fromStopId: c.fromStopId, depTime: c.depTime, arrTime: c.arrTime,
+      fromStopId: c.fromStopId, toStopId: c.toStopId, depTime: c.depTime, arrTime: c.arrTime,
+      prevHop: predecessor.get(c.fromStopId) ?? null,
     });
   }
 
@@ -260,17 +266,31 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
     return { ok: false, reason: 'no_journey_found', originWalk, destWalk };
   }
 
-  // Walk the predecessor chain back to an origin-seeded stop (no predecessor entry),
-  // merging consecutive hops on the same trip into a single ride leg.
+  // Walk the hop chain back to an origin-seeded stop (prevHop null), merging consecutive
+  // hops on the same trip into a single ride leg.
+  //
+  // This walks prevHop references, not a fresh Map.get(fromStopId) lookup — deliberately.
+  // predecessor is last-write-wins as the sweep finds improvements, so by the time
+  // reconstruction runs, predecessor.get(someStopId) reflects that stop's *final* best
+  // arrival, which isn't necessarily the one this hop's connection actually boarded
+  // against. Two different connections can each legitimately improve the other's stop
+  // (confirmed against real data: V/Line's Richmond<->Flinders St connections run both
+  // directions), which, if reconstruction re-resolves fromStopId through the live Map,
+  // can produce predecessor[A] and predecessor[B] pointing at each other — an
+  // unfollowable cycle despite each being individually valid when it was written.
+  // prevHop sidesteps this entirely: it's captured once, at the moment this hop is
+  // created, as a snapshot of whatever hop.fromStopId's chain was *then* — and since hop
+  // objects are never mutated after creation (only replaced), that snapshot can't later
+  // be invalidated by a subsequent improvement. Following prevHop is therefore a DAG walk
+  // by construction, not just a cycle-guarded one.
   const hops = [];
-  let cursor = bestStopId;
-  while (predecessor.has(cursor)) {
-    const hop = predecessor.get(cursor);
-    hops.push({ ...hop, toStopId: cursor });
-    cursor = hop.fromStopId;
+  let hop = predecessor.get(bestStopId) ?? null;
+  while (hop) {
+    hops.push(hop);
+    hop = hop.prevHop;
   }
   hops.reverse();
-  const boardStopId = cursor; // where the walking leg from origin lands
+  const boardStopId = hops.length > 0 ? hops[0].fromStopId : bestStopId; // where the walking leg from origin lands
 
   const legs = [];
   hops.forEach((hop) => {
