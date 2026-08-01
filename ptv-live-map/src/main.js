@@ -1783,6 +1783,48 @@ async function runJourneyGeocode(query) {
   renderJourneyPanel();
 }
 
+// Journey planning Phase 5: the full-timetable itinerary (api/plan-journey.js), shown
+// alongside Phase 3's live-only options — see that endpoint's header for why it needs a
+// real algorithm (CSA over static GTFS) rather than the live-feed scan above: it has no
+// blind spot for services that haven't started reporting position yet, and works for any
+// query time, not just "right now".
+//
+// renderJourneyPanel() runs on every location tick and data refresh (frequent), but this
+// fetch should only fire when the actual origin/destination pair changes — keyed the same
+// way runJourneyGeocode keys off journeyQuery, so a stale in-flight response can't clobber
+// a newer request's result.
+let plannedJourneyKey = null;
+let plannedJourneyResult = null;
+let plannedJourneyPending = false;
+
+function plannedJourneyKeyFor(origin, destination) {
+  return `${origin.lat.toFixed(4)},${origin.lon.toFixed(4)}->${destination.lat.toFixed(4)},${destination.lon.toFixed(4)}`;
+}
+
+async function ensurePlannedJourney(origin, destination) {
+  const key = plannedJourneyKeyFor(origin, destination);
+  if (key === plannedJourneyKey) return; // already fetched (or in flight) for this pair
+  plannedJourneyKey = key;
+  plannedJourneyPending = true;
+  plannedJourneyResult = null;
+
+  let result = { ok: false, reason: 'request_failed' };
+  try {
+    const params = new URLSearchParams({
+      originLat: origin.lat, originLon: origin.lon,
+      destLat: destination.lat, destLon: destination.lon,
+    });
+    const res = await fetch(`/api/plan-journey?${params}`);
+    result = await res.json();
+  } catch (err) {
+    console.error(err);
+  }
+  if (plannedJourneyKey !== key) return; // superseded by a newer origin/destination
+  plannedJourneyResult = result;
+  plannedJourneyPending = false;
+  renderJourneyPanel();
+}
+
 function selectJourneyDestination(point) {
   journeySearchInput.value = '';
   journeyQuery = '';
@@ -1921,6 +1963,79 @@ function renderJourneyOption(option) {
   return card;
 }
 
+// Deliberately separate wording from JOURNEY_CAVEAT above — this result carries the
+// opposite honesty caveat: it's schedule-accurate but positionally blind, where the live
+// section is positionally-grounded but can miss services outright (see this section's
+// header comment near ensurePlannedJourney).
+const PLANNED_JOURNEY_CAVEAT = "From the published timetable, not live positions — "
+  + "won't reflect delays, cancellations, or replacement buses.";
+
+const PLANNED_JOURNEY_ERROR_MESSAGES = {
+  no_walkable_stops: 'No train or V/Line stop is within walking range of your start or destination.',
+  no_journey_found: 'No timetabled journey found between those stops.',
+  missing_or_invalid_coordinates: "Couldn't look up the timetable for this trip.",
+  invalid_departure: "Couldn't look up the timetable for this trip.",
+  planning_failed: "Couldn't look up the timetable right now.",
+  request_failed: "Couldn't reach the timetable lookup — try again shortly.",
+};
+
+function renderPlannedJourneyCard(result) {
+  const card = document.createElement('div');
+  card.className = 'journey-option';
+
+  const originLine = document.createElement('div');
+  originLine.className = 'journey-option-summary';
+  originLine.textContent = `Walk ${result.origin.walkMinutes} min to ${result.origin.stopName}`;
+  card.appendChild(originLine);
+
+  result.legs.forEach((leg, i) => {
+    if (i > 0 && leg.transferMinutes !== null) {
+      const transferLine = document.createElement('div');
+      transferLine.className = 'journey-option-summary';
+      transferLine.textContent = leg.changedPlatform
+        ? `Change platform, ${leg.transferMinutes} min wait`
+        : `${leg.transferMinutes} min wait`;
+      card.appendChild(transferLine);
+    }
+    const modeLabel = MODES[leg.mode]?.label ?? leg.mode;
+    const info = routeInfo(leg.mode, leg.routeId);
+    card.appendChild(renderJourneyOptionLeg(
+      leg.mode, leg.routeId, leg.tripId,
+      `${modeLabel} ${info.name} — ${leg.boardStop} ${leg.boardTime} → ${leg.alightStop} ${leg.alightTime}`,
+    ));
+  });
+
+  const summary = document.createElement('div');
+  summary.className = 'journey-option-summary';
+  summary.textContent = `Walk ${result.destination.walkMinutes} min to ${result.destination.stopName} — `
+    + `arrive by ${result.arriveBy} (≈ ${result.totalMinutes} min total)`;
+  card.appendChild(summary);
+
+  return card;
+}
+
+function renderPlannedJourneySection() {
+  journeyResultsEl.appendChild(journeySectionLabel('Full itinerary (timetable)'));
+
+  if (plannedJourneyPending || !plannedJourneyResult) {
+    journeyResultsEl.appendChild(journeyEmptyMsg('Looking up the timetable…'));
+    return;
+  }
+
+  const caveat = document.createElement('div');
+  caveat.className = 'journey-caveat';
+  caveat.textContent = PLANNED_JOURNEY_CAVEAT;
+  journeyResultsEl.appendChild(caveat);
+
+  if (!plannedJourneyResult.ok) {
+    const message = PLANNED_JOURNEY_ERROR_MESSAGES[plannedJourneyResult.reason] ?? PLANNED_JOURNEY_ERROR_MESSAGES.planning_failed;
+    journeyResultsEl.appendChild(journeyEmptyMsg(message));
+    return;
+  }
+
+  journeyResultsEl.appendChild(renderPlannedJourneyCard(plannedJourneyResult));
+}
+
 function renderJourneyPanel() {
   if (!journeyPanelEl.classList.contains('open')) return;
 
@@ -1981,6 +2096,8 @@ function renderJourneyPanel() {
 
   const { options, originWalk, destWalk } = findLiveJourneys(userLocation, journeyDestination);
 
+  journeyResultsEl.appendChild(journeySectionLabel('Right now (live)'));
+
   const caveat = document.createElement('div');
   caveat.className = 'journey-caveat';
   caveat.textContent = JOURNEY_CAVEAT;
@@ -1991,6 +2108,9 @@ function renderJourneyPanel() {
   } else {
     journeyResultsEl.appendChild(journeyEmptyMsg("No live journey found right now. A service might still be coming that this can't see yet — try again shortly."));
   }
+
+  ensurePlannedJourney(userLocation, journeyDestination);
+  renderPlannedJourneySection();
 
   renderJourneyWalkSection('Stops near your start', originWalk);
   renderJourneyWalkSection('Stops near your destination', destWalk);
