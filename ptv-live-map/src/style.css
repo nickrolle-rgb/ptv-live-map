@@ -302,3 +302,56 @@ body.dark-mode {
 .journey-option-leg:last-of-type { margin-bottom: 0; }
 .journey-option-swatch { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .journey-option-summary { font-size: 11.5px; color: var(--text-muted); margin-top: 5px; }
+
+/* On-board ride detection: a floating confirmation prompt, not anchored to a toggle
+   button like #route-picker-panel/#journey-panel, so it's positioned fixed near the
+   bottom of the viewport instead of the top-anchored dropdown pattern those use — same
+   panel chrome and open/close transition, different placement. */
+#ride-prompt {
+  position: fixed; left: 50%; bottom: 20px;
+  background: var(--panel-bg); color: var(--text-primary);
+  border: 1px solid var(--panel-border); border-radius: 12px;
+  box-shadow: var(--shadow); padding: 14px; width: 280px; max-width: calc(100vw - 24px);
+  box-sizing: border-box;
+  opacity: 0; transform: translateX(-50%) translateY(6px) scale(0.98);
+  pointer-events: none;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+#ride-prompt.open { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); pointer-events: auto; }
+
+#ride-prompt-text { font-size: 13.5px; line-height: 1.4; margin-bottom: 8px; }
+
+#ride-prompt-caveat {
+  font-size: 11px; color: var(--text-muted); line-height: 1.4;
+  padding: 6px 8px; margin-bottom: 10px; border-radius: 6px; background: var(--input-bg);
+}
+#ride-prompt-caveat:empty { display: none; }
+
+#ride-prompt-actions { display: flex; gap: 8px; }
+#ride-prompt-yes, #ride-prompt-no {
+  flex: 1; padding: 8px 12px; font-size: 13px; font-weight: 500;
+  border-radius: 8px; border: 1px solid var(--panel-border);
+  background: var(--input-bg); color: var(--text-primary); cursor: pointer;
+  transition: background 0.1s ease;
+}
+#ride-prompt-yes:hover, #ride-prompt-no:hover { background: var(--row-hover); }
+
+/* Ride-progress view, rendered into #discovery-pane in place of the normal
+   nearest-stops list once a ride is confirmed. */
+.ride-progress-header {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 4px 8px 10px; margin-bottom: 6px; border-bottom: 1px solid var(--panel-border);
+}
+.ride-progress-title { font-size: 13.5px; font-weight: 600; color: var(--text-primary); }
+.ride-progress-exit {
+  font-size: 11px; color: var(--text-muted); cursor: pointer; background: none; border: none;
+  text-decoration: underline; text-underline-offset: 2px; padding: 0; white-space: nowrap;
+}
+.ride-progress-exit:hover { color: var(--text-primary); }
+.ride-progress-stop {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  padding: 7px 8px; border-radius: 8px;
+}
+.ride-progress-stop.here { background: var(--row-hover); }
+.ride-progress-stop-name { font-size: 13px; color: var(--text-primary); }
+.ride-progress-stop-eta { font-size: 11.5px; color: var(--text-muted); font-weight: 500; white-space: nowrap; }

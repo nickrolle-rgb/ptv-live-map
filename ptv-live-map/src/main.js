@@ -3,7 +3,8 @@ import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 import { haversineKm } from './geo.js';
 import { findWalkableStops, DEFAULT_WALK_CAP_MINUTES } from './journey.js';
-import { pickNextStop, describeNextStop, positionStaleness, STOP_SANITY_KM } from './stop-matching.js';
+import { pickNextStop, describeNextStop, positionStaleness, formatEtaMinutes, STOP_SANITY_KM } from './stop-matching.js';
+import { scoreCandidates, advanceStreaks, advanceDivergence } from './ride-detection.js';
 import trainRouteNames from './data/train-routes.json';
 import tramRouteNames from './data/tram-routes.json';
 import vlineRouteNames from './data/vline-routes.json';
@@ -76,6 +77,14 @@ let tripUpdatesByTrip = new Map();
 const tripHeadsignsByMode = {};
 let userLocation = null;
 let userLocationMarker = null;
+// On-board ride detection (see src/ride-detection.js for the scoring itself). None of
+// this persists across a reload — a stale "you're on trip X" claim after a refresh would
+// itself violate this app's honesty-over-confidence principle if the trip has since ended.
+let rideCandidateStreaks = new Map(); // tripId -> { count, everHeadingMatched, vehicleKey, mode, routeId }
+let pendingRidePrompt = null; // { tripId, mode, routeId, vehicleKey } | null — awaiting yes/no
+let confirmedRide = null; // { tripId, mode, routeId, vehicleKey } | null — user said yes
+let confirmedRideStops = null; // { routeId, stops: [...] } | null — full untruncated list, fetched separately from tripUpdatesByTrip
+let rideDivergenceCount = 0;
 const selectedRoutes = new Set();
 let searchQuery = '';
 let activeTab = 'all';
@@ -338,16 +347,6 @@ function resolveStop(mode, stopId, region) {
   if (!entry) return null;
   const [name, lat, lon] = entry;
   return { name, lat, lon };
-}
-
-function formatEtaMinutes(unixSeconds) {
-  const diffMs = unixSeconds * 1000 - Date.now();
-  const mins = Math.round(diffMs / 60000);
-  if (mins > 0) return `${mins} min`;
-  // mins === 0 is the predicted instant itself; negative means the predicted time has
-  // already passed per schedule but GPS hasn't confirmed departure yet — "now" would
-  // overstate confidence there, "soon" doesn't.
-  return mins === 0 ? 'now' : 'soon';
 }
 
 function formatDistance(km) {
@@ -905,6 +904,26 @@ async function fetchJson(url) {
   return res.json();
 }
 
+// On-board ride detection's "full remaining stop list" fetch — only called while
+// confirmedRide is set (see scheduleRefresh), and stored separately in
+// confirmedRideStops rather than merged into tripUpdatesByTrip (that map is rebuilt
+// wholesale every refreshData() tick, so writing here would either get clobbered by the
+// next capped refresh or leak an inflated stop count to every other consumer of that
+// shared map — see the implementation plan for the full rationale).
+async function fetchFullTripStops(mode, tripId) {
+  const data = await fetchJson(`/api/trip-updates?mode=${mode}&tripId=${encodeURIComponent(tripId)}`);
+  // The user may have dismissed or switched rides while this request was in flight.
+  if (!confirmedRide || confirmedRide.tripId !== tripId) return;
+  const entry = data && !Array.isArray(data) ? data[tripId] : null;
+  if (!entry) {
+    // GTFS-RT has dropped this trip from the feed entirely — unambiguous end-of-trip.
+    clearConfirmedRide();
+    return;
+  }
+  confirmedRideStops = entry;
+  updateDiscoveryPane();
+}
+
 async function refreshData() {
   const modeKeys = Object.keys(MODES);
 
@@ -1185,6 +1204,12 @@ const journeySearchInput = document.getElementById('journey-search');
 const journeySearchWrap = document.getElementById('journey-search-wrap');
 const journeySearchClearButton = document.getElementById('journey-search-clear');
 const journeyResultsEl = document.getElementById('journey-results');
+
+const ridePromptEl = document.getElementById('ride-prompt');
+const ridePromptTextEl = document.getElementById('ride-prompt-text');
+const ridePromptCaveatEl = document.getElementById('ride-prompt-caveat');
+const ridePromptYesButton = document.getElementById('ride-prompt-yes');
+const ridePromptNoButton = document.getElementById('ride-prompt-no');
 
 let activePane = 'discovery';
 let discoveryRadiusCircle = null;
@@ -1677,6 +1702,11 @@ function updateDiscoveryPane() {
   if (!panel.classList.contains('open') || activePane !== 'discovery') return;
   discoveryPaneEl.innerHTML = '';
 
+  if (confirmedRide) {
+    renderRideProgressView();
+    return;
+  }
+
   if (!userLocation) {
     const msg = document.createElement('div');
     msg.className = 'discovery-empty';
@@ -1718,12 +1748,74 @@ function updateDiscoveryPane() {
       const info = routeInfo(u.mode, u.routeId);
       chip.style.background = info.color || MODES[u.mode]?.color || '#666';
       const etaSeconds = u.departure ?? u.arrival;
-      chip.textContent = `${info.name} · ${formatEtaMinutes(etaSeconds)}`;
+      chip.textContent = `${info.name} · ${formatEtaMinutes(etaSeconds, Date.now())}`;
       chips.appendChild(chip);
     });
     row.appendChild(chips);
 
     row.addEventListener('click', () => map.setView([stop.lat, stop.lon], 17));
+    discoveryPaneEl.appendChild(row);
+  });
+}
+
+// Renders into discoveryPaneEl in place of the normal nearest-stops list, following
+// renderJourneyPanel()'s clear-and-rebuild idiom rather than the 2-pane swipe-track
+// mechanism (switchPane() is hard-coded to exactly 2 panes via %-transform math and
+// isn't a good extension point for a 3rd view). Called only from updateDiscoveryPane(),
+// which has already cleared discoveryPaneEl before calling this.
+function renderRideProgressView() {
+  const info = routeInfo(confirmedRide.mode, confirmedRide.routeId);
+  const headsign = headsignFor(confirmedRide.mode, confirmedRide.tripId);
+  const modeLabel = confirmedRide.mode === 'bus' ? BUS_LABEL : (MODES[confirmedRide.mode]?.label ?? confirmedRide.mode);
+
+  const header = document.createElement('div');
+  header.className = 'ride-progress-header';
+  const title = document.createElement('span');
+  title.className = 'ride-progress-title';
+  title.textContent = headsign ? `${info.name} ${modeLabel} · ${headsign}` : `${info.name} ${modeLabel}`;
+  const exitButton = document.createElement('button');
+  exitButton.type = 'button';
+  exitButton.className = 'ride-progress-exit';
+  exitButton.textContent = 'Not on this anymore';
+  exitButton.addEventListener('click', clearConfirmedRide);
+  header.appendChild(title);
+  header.appendChild(exitButton);
+  discoveryPaneEl.appendChild(header);
+
+  if (!confirmedRideStops) {
+    discoveryPaneEl.appendChild(journeyEmptyMsg('Loading the rest of this trip…'));
+    return;
+  }
+
+  const resolvedStops = confirmedRideStops.stops.map((stopUpdate) => ({
+    stopUpdate,
+    stop: resolveStop(confirmedRide.mode, stopUpdate.stopId, null),
+  }));
+  // Marks the stop nearest the vehicle's current live position as "you are here" —
+  // reuses pickNextStop the same self-correcting way nextStopInfo does for a single
+  // next stop (src/stop-matching.js), applied across this full list instead.
+  const vehicle = allVehicles.find((v) => `${v.mode}-${v.id}` === confirmedRide.vehicleKey);
+  const hereBest = vehicle ? pickNextStop(resolvedStops, vehicle.lat, vehicle.lon, STOP_SANITY_KM[confirmedRide.mode]) : null;
+  const hereStopId = hereBest?.stopUpdate?.stopId ?? null;
+
+  resolvedStops.forEach(({ stopUpdate, stop }) => {
+    if (!stop) return; // stopId didn't resolve against static data -- skip rather than show a blank row
+    const row = document.createElement('div');
+    row.className = stopUpdate.stopId === hereStopId ? 'ride-progress-stop here' : 'ride-progress-stop';
+
+    const nameEl = document.createElement('span');
+    nameEl.className = 'ride-progress-stop-name';
+    nameEl.textContent = stop.name;
+    row.appendChild(nameEl);
+
+    const etaSeconds = stopUpdate.departure ?? stopUpdate.arrival;
+    if (etaSeconds != null) {
+      const etaEl = document.createElement('span');
+      etaEl.className = 'ride-progress-stop-eta';
+      etaEl.textContent = formatEtaMinutes(etaSeconds, Date.now());
+      row.appendChild(etaEl);
+    }
+
     discoveryPaneEl.appendChild(row);
   });
 }
@@ -2287,6 +2379,107 @@ function checkInitialLoadDone() {
   if (mapSettled && dataSettled) document.getElementById('map-loading')?.classList.add('hidden');
 }
 
+// Snapshot every tracked vehicle's position as of its last *actual* feed change,
+// vehicleKey -> { lat, lon, timestampMs } — ride-detection's own prior-fix bookkeeping,
+// updated only from updateRideDetection() below. Deliberately NOT reusing
+// marker._lastRawLatLng/_lastRawUpdateAt (renderMarkers()'s own per-marker history):
+// renderMarkers() is called from two independent places (the 10s data-refresh cycle and
+// this same geolocation callback), and both mutate that state — whichever call happens
+// to run first after a real vehicle move "consumes" the transition, so a later read from
+// the other caller often sees the vehicle's already-current position as "prior",
+// silently reading back zero movement. A single-writer store scoped to ride-detection
+// alone (only ever updated here, once per tick) avoids that race entirely.
+let rideVehicleFixes = new Map();
+function captureRideVehicleFixes() {
+  const next = new Map();
+  allVehicles.forEach((v) => {
+    if (v.lat == null || v.lon == null || v.timestamp == null) return;
+    next.set(`${v.mode}-${v.id}`, { lat: v.lat, lon: v.lon, timestampMs: v.timestamp * 1000 });
+  });
+  rideVehicleFixes = next;
+}
+
+function showRidePrompt(candidate) {
+  pendingRidePrompt = candidate;
+  const info = routeInfo(candidate.mode, candidate.routeId);
+  const modeLabel = (candidate.mode === 'bus' ? BUS_LABEL : (MODES[candidate.mode]?.label ?? candidate.mode)).replace(/s$/, '').toLowerCase();
+  const headsign = headsignFor(candidate.mode, candidate.tripId);
+  ridePromptTextEl.textContent = headsign
+    ? `Looks like you might be on the ${info.name} ${modeLabel} towards ${headsign}?`
+    : `Looks like you might be on the ${info.name} ${modeLabel}?`;
+  ridePromptCaveatEl.textContent = "Based on your phone's location matching this vehicle's live position and movement — not a ticket check.";
+  ridePromptEl.classList.add('open');
+}
+
+function hideRidePrompt() {
+  pendingRidePrompt = null;
+  ridePromptEl.classList.remove('open');
+}
+
+// Shared cleanup for all three exit paths (trip ends, sustained GPS divergence, manual
+// "not on this anymore") — see fetchFullTripStops/scheduleRefresh for the end-of-trip
+// check and updateRideDetection for the divergence check.
+function clearConfirmedRide() {
+  confirmedRide = null;
+  confirmedRideStops = null;
+  rideCandidateStreaks = new Map();
+  rideDivergenceCount = 0;
+  hideRidePrompt();
+  updateDiscoveryPane();
+}
+
+ridePromptYesButton.addEventListener('click', () => {
+  if (!pendingRidePrompt) return;
+  confirmedRide = pendingRidePrompt;
+  pendingRidePrompt = null;
+  rideDivergenceCount = 0;
+  ridePromptEl.classList.remove('open');
+  fetchFullTripStops(confirmedRide.mode, confirmedRide.tripId);
+  updateDiscoveryPane();
+});
+ridePromptNoButton.addEventListener('click', () => {
+  // Dropping the streak (rather than just hiding the prompt) means this tripId has to
+  // rebuild real evidence from scratch before it can prompt again, instead of
+  // immediately re-firing next tick — a lightweight, self-resetting form of "not now"
+  // without needing a separate persisted dismissal timer.
+  if (pendingRidePrompt) rideCandidateStreaks.delete(pendingRidePrompt.tripId);
+  hideRidePrompt();
+});
+
+// userFixPrev/userFixNext: the same before/after userLocation pair the ~20m visibility
+// throttle above already computes movedKm from — see the watchPosition callback below.
+// Only called when the user has actually moved that ~20m, for the same reason
+// renderMarkers()/updateDiscoveryPane() are throttled there: computing real speed/
+// heading needs a genuine displacement, not GPS jitter between near-identical fixes.
+function updateRideDetection(userFixPrev, userFixNext) {
+  if (!userFixPrev) {
+    captureRideVehicleFixes(); // still establish a baseline for the next tick
+    return;
+  }
+  const priorVehicleFixes = rideVehicleFixes;
+
+  if (confirmedRide) {
+    const candidates = scoreCandidates({ userFixPrev, userFixNext, vehicles: allVehicles, priorVehicleFixes });
+    const candidateForConfirmed = candidates.find((c) => c.tripId === confirmedRide.tripId) ?? null;
+    const { count, shouldExit } = advanceDivergence(rideDivergenceCount, candidateForConfirmed);
+    rideDivergenceCount = count;
+    captureRideVehicleFixes();
+    if (shouldExit) clearConfirmedRide();
+    return;
+  }
+
+  const candidates = scoreCandidates({ userFixPrev, userFixNext, vehicles: allVehicles, priorVehicleFixes });
+  const { streaks, eligibleTripIds } = advanceStreaks(rideCandidateStreaks, candidates);
+  rideCandidateStreaks = streaks;
+  captureRideVehicleFixes();
+
+  if (pendingRidePrompt && !streaks.has(pendingRidePrompt.tripId)) hideRidePrompt();
+  if (!pendingRidePrompt && eligibleTripIds.length === 1) {
+    const streak = streaks.get(eligibleTripIds[0]);
+    showRidePrompt({ tripId: eligibleTripIds[0], mode: streak.mode, routeId: streak.routeId, vehicleKey: streak.vehicleKey });
+  }
+}
+
 function centerOnUser() {
   if (!navigator.geolocation) {
     mapSettled = true;
@@ -2298,7 +2491,14 @@ function centerOnUser() {
   // later updates just move the dot, so the view doesn't jump around as GPS refines.
   navigator.geolocation.watchPosition(
     (position) => {
-      userLocation = { lat: position.coords.latitude, lon: position.coords.longitude };
+      userLocation = {
+        lat: position.coords.latitude,
+        lon: position.coords.longitude,
+        timestampMs: Date.now(),
+        // Often null/unreliable at low speed on many devices — ride-detection.js falls
+        // back to computing a bearing from consecutive fixes when this is unavailable.
+        headingDeg: Number.isFinite(position.coords.heading) ? position.coords.heading : null,
+      };
       if (!hasCenteredOnUser) {
         hasCenteredOnUser = true;
         map.fitBounds(boundsAroundPoint(userLocation.lat, userLocation.lon, LOCAL_RADIUS_KM));
@@ -2320,10 +2520,13 @@ function centerOnUser() {
         ? haversineKm(lastVisibilityUserLocation.lat, lastVisibilityUserLocation.lon, userLocation.lat, userLocation.lon)
         : Infinity;
       if (movedKm > VISIBILITY_REFRESH_KM) {
+        // Captured before reassignment — this is updateRideDetection's "prior" user fix.
+        const previousUserLocation = lastVisibilityUserLocation;
         lastVisibilityUserLocation = userLocation;
         renderMarkers();
         updateDiscoveryPane();
         renderJourneyPanel();
+        updateRideDetection(previousUserLocation, userLocation);
       }
     },
     () => {
@@ -2340,6 +2543,9 @@ async function scheduleRefresh() {
     composeVehicles();
     renderMarkers();
     updateRouteStatuses();
+    // Only fetched while a ride is confirmed — not part of the always-on per-mode poll
+    // above, so this never adds payload/latency to the normal refresh cycle.
+    if (confirmedRide) fetchFullTripStops(confirmedRide.mode, confirmedRide.tripId);
     updateDiscoveryPane();
     renderJourneyPanel();
   } catch (err) {

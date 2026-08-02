@@ -10,8 +10,17 @@ const FEEDS = {
 };
 
 export default async function handler(req) {
-  const requestedMode = new URL(req.url).searchParams.get('mode');
+  const params = new URL(req.url).searchParams;
+  const requestedMode = params.get('mode');
   const mode = FEEDS[requestedMode] ? requestedMode : 'tram';
+  // When present, this one trip's stop list is returned unsliced (the upstream feed
+  // already carries the full remaining-stop sequence per trip — confirmed empirically,
+  // up to 25 stops observed on a real trip — this app's own stopsPerTrip cap below is a
+  // payload-size choice, not an upstream limitation). Used for the on-board ride
+  // detection feature's "show remaining stops to end of line" view; every other trip in
+  // the same response still gets the normal capped list, so the always-on poll driving
+  // the main nearest-stops view is unaffected.
+  const fullTripId = params.get('tripId');
 
   try {
     const upstream = await fetch(FEEDS[mode], { headers: { KeyID: process.env.GTFS_API_KEY } });
@@ -28,7 +37,9 @@ export default async function handler(req) {
     feed.entity.forEach((entity) => {
       const tu = entity.tripUpdate;
       const tripId = tu?.trip?.tripId;
-      const stus = tu?.stopTimeUpdate?.slice(0, stopsPerTrip);
+      const stus = fullTripId && tripId === fullTripId
+        ? tu?.stopTimeUpdate
+        : tu?.stopTimeUpdate?.slice(0, stopsPerTrip);
       if (!tripId || !stus?.length) return;
       updates[tripId] = {
         routeId: tu.trip?.routeId ?? null,

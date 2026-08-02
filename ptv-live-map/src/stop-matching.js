@@ -17,7 +17,10 @@ export const STOP_SANITY_KM = {
   bus: { at: 0.15, next: 5 },
 };
 
-function formatEtaMinutes(unixSeconds, nowMs) {
+// Exported (not just used internally by describeNextStop) so any other view needing the
+// same "N min / now / soon" text — e.g. a per-stop ETA list rather than a single next
+// stop — reuses this exact formatting instead of re-deriving it.
+export function formatEtaMinutes(unixSeconds, nowMs) {
   const diffMs = unixSeconds * 1000 - nowMs;
   const mins = Math.round(diffMs / 60000);
   if (mins > 0) return `${mins} min`;

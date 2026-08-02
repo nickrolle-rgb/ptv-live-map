@@ -68,6 +68,42 @@ describe('api/trip-updates — stopsPerTrip cap', () => {
   });
 });
 
+describe('api/trip-updates — tripId param (on-board ride detection full stop list)', () => {
+  const twentyStops = Array.from({ length: 20 }, (_, i) => stu(`S${i}`, 1000 + i, 1010 + i));
+
+  it('returns the full unsliced stop list for the one trip matching tripId', async () => {
+    mockFeed([{ tripUpdate: { trip: { tripId: 'T1', routeId: 'R1' }, stopTimeUpdate: twentyStops } }]);
+    const res = await handler(req('?mode=train&tripId=T1'));
+    const body = await res.json();
+    expect(body.T1.stops).toHaveLength(20);
+  });
+
+  it('still applies the normal stopsPerTrip cap to every other trip in the same response', async () => {
+    mockFeed([
+      { tripUpdate: { trip: { tripId: 'T1', routeId: 'R1' }, stopTimeUpdate: twentyStops } },
+      { tripUpdate: { trip: { tripId: 'T2', routeId: 'R2' }, stopTimeUpdate: twentyStops } },
+    ]);
+    const res = await handler(req('?mode=train&tripId=T1'));
+    const body = await res.json();
+    expect(body.T1.stops).toHaveLength(20);
+    expect(body.T2.stops).toHaveLength(4);
+  });
+
+  it('applies the normal cap to every trip when tripId does not match any entity', async () => {
+    mockFeed([{ tripUpdate: { trip: { tripId: 'T1', routeId: 'R1' }, stopTimeUpdate: twentyStops } }]);
+    const res = await handler(req('?mode=train&tripId=NONEXISTENT'));
+    const body = await res.json();
+    expect(body.T1.stops).toHaveLength(4);
+  });
+
+  it('behaves exactly as before when tripId is absent (no regression to the always-on poll)', async () => {
+    mockFeed([{ tripUpdate: { trip: { tripId: 'T1', routeId: 'R1' }, stopTimeUpdate: twentyStops } }]);
+    const res = await handler(req('?mode=train'));
+    const body = await res.json();
+    expect(body.T1.stops).toHaveLength(4);
+  });
+});
+
 describe('api/trip-updates — entity filtering', () => {
   it('skips entities with no tripId', async () => {
     mockFeed([{ tripUpdate: { trip: {}, stopTimeUpdate: [stu('S1', 1000, 1010)] } }]);
