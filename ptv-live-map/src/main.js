@@ -3,6 +3,7 @@ import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 import { haversineKm } from './geo.js';
 import { findWalkableStops, DEFAULT_WALK_CAP_MINUTES } from './journey.js';
+import { pickNextStop, describeNextStop, STOP_SANITY_KM } from './stop-matching.js';
 import trainRouteNames from './data/train-routes.json';
 import tramRouteNames from './data/tram-routes.json';
 import vlineRouteNames from './data/vline-routes.json';
@@ -376,13 +377,9 @@ function formatAge(ms) {
 // this) was loose enough that a train still hundreds of metres out could be labelled
 // "At: Station" with nothing to visually back that up. Tightened to roughly platform
 // length plus GPS slop per mode; "next" (a different, coarser sanity check for
-// picking a plausible upcoming stop at all) is unchanged.
-const STOP_SANITY_KM = {
-  tram: { at: 0.15, next: 3 },
-  train: { at: 0.25, next: 10 },
-  vline: { at: 0.35, next: 60 },
-  bus: { at: 0.15, next: 5 },
-};
+// picking a plausible upcoming stop at all) is unchanged. Values live in
+// stop-matching.js (imported above) so the unit tests covering this scoring logic
+// exercise the exact same numbers this file renders with.
 
 // trip-updates and vehicle-positions are two independently-polled feeds, joined only
 // by tripId — trip-updates can lag behind and still list a stop the vehicle's live GPS
@@ -391,33 +388,20 @@ const STOP_SANITY_KM = {
 // trusting the feed's first remaining stop, score every stop kept for this trip (see
 // stopsPerTrip in api/trip-updates.js) by live distance and take the closest one within
 // sanity range — this self-corrects as soon as the true current/next stop is anywhere
-// in that short lookahead list, instead of surfacing a stale station name.
+// in that short lookahead list, instead of surfacing a stale station name. The scoring
+// itself (pickNextStop/describeNextStop) lives in stop-matching.js, testable without
+// this file's DOM/Leaflet/fetch state; this function is just the resolveStop glue.
 function nextStopInfo(mode, tripId, vLat, vLon, region) {
   if (!tripId || vLat == null || vLon == null) return null;
   const update = tripUpdatesByTrip.get(`${mode}:${tripId}`);
-  const { at: atMaxKm, next: nextMaxKm } = STOP_SANITY_KM[mode];
+  const sanity = STOP_SANITY_KM[mode];
 
-  let best = null;
-  for (const stopUpdate of update?.stops ?? []) {
-    const stop = resolveStop(mode, stopUpdate.stopId, region);
-    if (!stop) continue;
-    const distanceKm = haversineKm(vLat, vLon, stop.lat, stop.lon);
-    if (distanceKm > nextMaxKm) continue;
-    if (!best || distanceKm < best.distanceKm) best = { stopUpdate, stop, distanceKm };
-  }
-  if (!best) return null;
-
-  const { stopUpdate, stop, distanceKm } = best;
-  const { arrival, departure } = stopUpdate;
-  if (distanceKm <= atMaxKm) {
-    return departure == null
-      ? { label: 'At', name: stop.name, eta: null, lat: stop.lat, lon: stop.lon, arrival, departure }
-      : { label: 'At', name: stop.name, eta: formatEtaMinutes(departure), etaVerb: 'departing', lat: stop.lat, lon: stop.lon, arrival, departure };
-  }
-  const etaSeconds = departure ?? arrival;
-  return etaSeconds == null
-    ? { label: 'Next stop', name: stop.name, eta: null, lat: stop.lat, lon: stop.lon, arrival, departure }
-    : { label: 'Next stop', name: stop.name, eta: formatEtaMinutes(etaSeconds), etaVerb: null, lat: stop.lat, lon: stop.lon, arrival, departure };
+  const resolved = (update?.stops ?? []).map((stopUpdate) => ({
+    stopUpdate,
+    stop: resolveStop(mode, stopUpdate.stopId, region),
+  }));
+  const best = pickNextStop(resolved, vLat, vLon, sanity);
+  return describeNextStop(best, sanity);
 }
 
 // Speed a schedule-predicted hop would imply, above which we distrust the trip-updates
