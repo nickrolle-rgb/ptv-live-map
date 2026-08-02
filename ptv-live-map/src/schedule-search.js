@@ -225,18 +225,28 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
     });
   });
 
-  function canBoard(stopId, depTime) {
+  // Returns the interchange-group member stop whose earliest arrival actually permits
+  // boarding this connection — may differ from `stopId` itself when boarding requires a
+  // same-station platform transfer (e.g. the rider's earliest arrival is at S2, but this
+  // connection departs from a different stop_id, S2B, sharing S2's station name). Null
+  // if nothing in the group permits it in time.
+  function boardingStop(stopId, depTime) {
     const edges = interchangeGroups.get(stopId) || [{ stopId, transferSec: 0 }];
-    return edges.some(({ stopId: fromStop, transferSec }) => {
+    for (const { stopId: fromStop, transferSec } of edges) {
       const arr = earliestArrival.get(fromStop);
-      return arr !== undefined && arr + transferSec <= depTime;
-    });
+      if (arr !== undefined && arr + transferSec <= depTime) return fromStop;
+    }
+    return null;
   }
 
   for (const c of connections) {
     if (c.depTime < queryAbs) continue;
-    const boardable = inTrip.has(c.tripId) || canBoard(c.fromStopId, c.depTime);
-    if (!boardable) continue;
+    // inTrip.has(c.tripId): already riding this trip, so the boarding stop is simply
+    // wherever it was already boarded (c.fromStopId itself) — no interchange lookup
+    // needed or correct here, since earliestArrival was never separately recorded for
+    // every intermediate stop_id of a trip already being ridden.
+    const boardFromStop = inTrip.has(c.tripId) ? c.fromStopId : boardingStop(c.fromStopId, c.depTime);
+    if (boardFromStop === null) continue;
     inTrip.add(c.tripId);
     const currentBest = earliestArrival.get(c.toStopId);
     if (currentBest !== undefined && currentBest <= c.arrTime) continue;
@@ -244,7 +254,15 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
     predecessor.set(c.toStopId, {
       tripId: c.tripId, routeId: c.routeId, mode: c.mode,
       fromStopId: c.fromStopId, toStopId: c.toStopId, depTime: c.depTime, arrTime: c.arrTime,
-      prevHop: predecessor.get(c.fromStopId) ?? null,
+      // Linked via boardFromStop, not c.fromStopId — see boardingStop's comment above.
+      // Using c.fromStopId directly here was a real bug this file's test suite caught:
+      // predecessor has no entry for a stop_id nobody ever actually arrived at via a
+      // connection, so the chain silently truncated at the first platform-transfer,
+      // dropping every earlier leg from the reconstructed itinerary while totalMinutes/
+      // arriveBy (computed independently, from earliestArrival) still reported the full,
+      // correct journey time — an itinerary that claimed a duration its own displayed
+      // legs didn't account for.
+      prevHop: predecessor.get(boardFromStop) ?? null,
     });
   }
 
