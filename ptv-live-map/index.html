@@ -48,6 +48,14 @@
         <button id="journey-close" type="button" aria-label="Close">&times;</button>
       </div>
       <div id="journey-origin-row"></div>
+      <div id="journey-time-row">
+        <select id="journey-time-mode">
+          <option value="now">Leave now</option>
+          <option value="depart">Leave at</option>
+          <option value="arrive">Arrive by</option>
+        </select>
+        <input type="time" id="journey-time-input" />
+      </div>
       <div id="journey-search-wrap">
         <input type="text" id="journey-search" placeholder="Search a destination stop" />
         <button type="button" id="journey-search-clear" aria-label="Clear search">&times;</button>

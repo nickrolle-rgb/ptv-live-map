@@ -1185,6 +1185,8 @@ const journeyToggleButton = document.getElementById('journey-toggle');
 const journeyPanelEl = document.getElementById('journey-panel');
 const journeyCloseButton = document.getElementById('journey-close');
 const journeyOriginRowEl = document.getElementById('journey-origin-row');
+const journeyTimeModeEl = document.getElementById('journey-time-mode');
+const journeyTimeInputEl = document.getElementById('journey-time-input');
 const journeySearchInput = document.getElementById('journey-search');
 const journeySearchWrap = document.getElementById('journey-search-wrap');
 const journeySearchClearButton = document.getElementById('journey-search-clear');
@@ -1740,6 +1742,38 @@ let journeyDestination = null; // { lat, lon, label } | null
 let journeyDestMarker = null;
 let journeyQuery = '';
 
+// Journey planning: when to travel — 'now' (default), 'depart' (leave at a chosen
+// time), or 'arrive' (arrive by a chosen time; api/plan-journey.js's
+// planJourneyArrivingBy). Only meaningful for the Phase 5 timetable section below —
+// Phase 3's live-first matching has no notion of a future/past query, it only ever
+// sees what's reporting position right now, so that section is hidden outside 'now'
+// rather than silently showing "live" results for a different time.
+let journeyTimeMode = 'now';
+let journeyTimeValue = ''; // "HH:MM" from the <input type="time">, browser-local
+
+// Interprets journeyTimeValue as a wall-clock time on the browser's own local calendar
+// day, rolling to tomorrow if that time has already passed today — the ordinary meaning
+// of picking a bare time with no date ("8am" said at 9pm means tomorrow). Uses the
+// browser's local timezone rather than an Australia/Melbourne-aware conversion (unlike
+// the server-side melbourneDateAndSeconds): a plain <input type="time"> has no timezone
+// concept of its own, and this app's whole live-map premise already assumes it's being
+// used in Melbourne, so browser-local and Melbourne-local coincide for the overwhelming
+// majority of real usage.
+function journeyTimeValueToEpochMs(hhmm, nowMs) {
+  const [h, m] = hhmm.split(':').map(Number);
+  const d = new Date(nowMs);
+  d.setHours(h, m, 0, 0);
+  if (d.getTime() <= nowMs) d.setDate(d.getDate() + 1);
+  return d.getTime();
+}
+
+// { mode: 'now' } | { mode: 'depart'|'arrive', epochMs }. Falls back to 'now' whenever
+// a non-'now' mode is selected but no time has actually been picked yet.
+function journeyWhenSpec() {
+  if (journeyTimeMode === 'now' || !journeyTimeValue) return { mode: 'now' };
+  return { mode: journeyTimeMode, epochMs: journeyTimeValueToEpochMs(journeyTimeValue, Date.now()) };
+}
+
 // Nominatim address search (api/geocode.js) — debounced well past its 1-req/sec usage
 // policy, and gated behind a 3-character minimum so it never fires on a stray keypress.
 // journeyGeocodeResults/Pending are keyed implicitly to journeyQuery: a response only
@@ -1781,13 +1815,14 @@ let plannedJourneyKey = null;
 let plannedJourneyResult = null;
 let plannedJourneyPending = false;
 
-function plannedJourneyKeyFor(origin, destination) {
-  return `${origin.lat.toFixed(4)},${origin.lon.toFixed(4)}->${destination.lat.toFixed(4)},${destination.lon.toFixed(4)}`;
+function plannedJourneyKeyFor(origin, destination, when) {
+  return `${origin.lat.toFixed(4)},${origin.lon.toFixed(4)}->${destination.lat.toFixed(4)},${destination.lon.toFixed(4)}`
+    + `@${when.mode}:${when.epochMs ?? ''}`;
 }
 
-async function ensurePlannedJourney(origin, destination) {
-  const key = plannedJourneyKeyFor(origin, destination);
-  if (key === plannedJourneyKey) return; // already fetched (or in flight) for this pair
+async function ensurePlannedJourney(origin, destination, when) {
+  const key = plannedJourneyKeyFor(origin, destination, when);
+  if (key === plannedJourneyKey) return; // already fetched (or in flight) for this pair+time
   plannedJourneyKey = key;
   plannedJourneyPending = true;
   plannedJourneyResult = null;
@@ -1798,12 +1833,14 @@ async function ensurePlannedJourney(origin, destination) {
       originLat: origin.lat, originLon: origin.lon,
       destLat: destination.lat, destLon: destination.lon,
     });
+    if (when.mode === 'depart') params.set('departure', when.epochMs);
+    else if (when.mode === 'arrive') params.set('arriveBy', when.epochMs);
     const res = await fetch(`/api/plan-journey?${params}`);
     result = await res.json();
   } catch (err) {
     console.error(err);
   }
-  if (plannedJourneyKey !== key) return; // superseded by a newer origin/destination
+  if (plannedJourneyKey !== key) return; // superseded by a newer origin/destination/time
   plannedJourneyResult = result;
   plannedJourneyPending = false;
   renderJourneyPanel();
@@ -1957,8 +1994,10 @@ const PLANNED_JOURNEY_CAVEAT = "From the published timetable, not live positions
 const PLANNED_JOURNEY_ERROR_MESSAGES = {
   no_walkable_stops: 'No train or V/Line stop is within walking range of your start or destination.',
   no_journey_found: 'No timetabled journey found between those stops.',
+  unreachable_by_target: "No timetabled journey arrives that early — try a later time.",
   missing_or_invalid_coordinates: "Couldn't look up the timetable for this trip.",
   invalid_departure: "Couldn't look up the timetable for this trip.",
+  invalid_arrive_by: "Couldn't look up the timetable for this trip.",
   planning_failed: "Couldn't look up the timetable right now.",
   request_failed: "Couldn't reach the timetable lookup — try again shortly.",
 };
@@ -1966,6 +2005,16 @@ const PLANNED_JOURNEY_ERROR_MESSAGES = {
 function renderPlannedJourneyCard(result) {
   const card = document.createElement('div');
   card.className = 'journey-option';
+
+  // Only present for an 'arrive by' query (planJourneyArrivingBy) — shown so a rider can
+  // see at a glance that the actual arrival below is at/before what they asked for, not
+  // just trust it silently (Principle 1: honesty over confidence).
+  if (result.requestedArriveBy) {
+    const requestedLine = document.createElement('div');
+    requestedLine.className = 'journey-option-summary journey-muted';
+    requestedLine.textContent = `Requested: arrive by ${result.requestedArriveBy}`;
+    card.appendChild(requestedLine);
+  }
 
   const originLine = document.createElement('div');
   originLine.className = 'journey-option-summary';
@@ -2027,6 +2076,10 @@ function renderJourneyPanel() {
     ? 'From: <strong>Your location</strong>'
     : '<span class="journey-muted">From: enable location, or tap the map to set a destination</span>';
 
+  journeyTimeModeEl.value = journeyTimeMode;
+  journeyTimeInputEl.value = journeyTimeValue;
+  journeyTimeInputEl.classList.toggle('hidden', journeyTimeMode === 'now');
+
   journeyResultsEl.innerHTML = '';
 
   const query = journeyQuery.trim().toLowerCase();
@@ -2079,21 +2132,29 @@ function renderJourneyPanel() {
   }
 
   const { options, originWalk, destWalk } = findLiveJourneys(userLocation, journeyDestination);
+  const when = journeyWhenSpec();
 
   journeyResultsEl.appendChild(journeySectionLabel('Right now (live)'));
 
-  const caveat = document.createElement('div');
-  caveat.className = 'journey-caveat';
-  caveat.textContent = JOURNEY_CAVEAT;
-  journeyResultsEl.appendChild(caveat);
+  if (when.mode === 'now') {
+    const caveat = document.createElement('div');
+    caveat.className = 'journey-caveat';
+    caveat.textContent = JOURNEY_CAVEAT;
+    journeyResultsEl.appendChild(caveat);
 
-  if (options.length > 0) {
-    options.forEach((option) => journeyResultsEl.appendChild(renderJourneyOption(option)));
+    if (options.length > 0) {
+      options.forEach((option) => journeyResultsEl.appendChild(renderJourneyOption(option)));
+    } else {
+      journeyResultsEl.appendChild(journeyEmptyMsg("No live journey found right now. A service might still be coming that this can't see yet — try again shortly."));
+    }
   } else {
-    journeyResultsEl.appendChild(journeyEmptyMsg("No live journey found right now. A service might still be coming that this can't see yet — try again shortly."));
+    // Phase 3's live matching only ever sees currently-active trips — it has no way to
+    // answer a future/past query, so it's hidden here rather than shown against the
+    // wrong time (Principle 1: honesty over confidence).
+    journeyResultsEl.appendChild(journeyEmptyMsg('Live positions only cover right now — see the timetable below for your chosen time.'));
   }
 
-  ensurePlannedJourney(userLocation, journeyDestination);
+  ensurePlannedJourney(userLocation, journeyDestination, when);
   renderPlannedJourneySection();
 
   renderJourneyWalkSection('Stops near your start', originWalk);
@@ -2109,6 +2170,22 @@ function initJourneyPanel() {
   }
   journeyToggleButton.addEventListener('click', () => setJourneyPanelOpen(!journeyPanelEl.classList.contains('open')));
   journeyCloseButton.addEventListener('click', () => setJourneyPanelOpen(false));
+
+  journeyTimeModeEl.addEventListener('change', (e) => {
+    journeyTimeMode = e.target.value;
+    // Default the time picker to now/soon the moment it becomes relevant, rather than
+    // leaving it empty (which would silently fall back to 'now' behavior per
+    // journeyWhenSpec — technically correct but a confusing empty box to show the user).
+    if (journeyTimeMode !== 'now' && !journeyTimeValue) {
+      const d = new Date();
+      journeyTimeValue = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    }
+    renderJourneyPanel();
+  });
+  journeyTimeInputEl.addEventListener('change', (e) => {
+    journeyTimeValue = e.target.value;
+    renderJourneyPanel();
+  });
 
   journeySearchInput.addEventListener('input', (e) => {
     journeyQuery = e.target.value;

@@ -237,6 +237,16 @@ body.dark-mode {
 
 #journey-origin-row { font-size: 13px; color: var(--text-primary); margin-bottom: 10px; }
 
+#journey-time-row { display: flex; gap: 6px; margin-bottom: 10px; }
+#journey-time-mode, #journey-time-input {
+  font-size: 12.5px; padding: 6px 8px; border-radius: 8px;
+  border: 1px solid var(--panel-border); background: var(--input-bg); color: var(--text-primary);
+}
+#journey-time-mode { flex: 1; min-width: 0; }
+#journey-time-input { flex: 1; min-width: 0; }
+#journey-time-input.hidden { display: none; }
+#journey-time-mode:focus, #journey-time-input:focus { outline: none; border-color: #6b46c1; }
+
 #journey-search-wrap { position: relative; margin-bottom: 6px; }
 #journey-search {
   width: 100%; box-sizing: border-box; padding: 8px 30px 8px 10px; font-size: 13px;
