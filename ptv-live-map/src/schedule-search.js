@@ -363,3 +363,69 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
     arriveBy: formatTimeOfDay(bestArrival),
   };
 }
+
+// "Arrive by Z" — answered by binary-searching planJourney's own departure time, not a
+// separate reverse-CSA implementation. This relies on one property: querying a later
+// departure can only ever see a subset of an earlier query's connections (anything with
+// c.depTime < queryAbs is dropped), so the resulting arrival time is non-decreasing as
+// departure time increases. That makes "does departing at time t still arrive by Z" a
+// simple sorted-boolean-array search — the latest still-valid t is the answer — without
+// writing and separately maintaining a second, reverse-direction version of the CSA scan
+// (and re-risking the same class of reconstruction bug the forward version had).
+// Costs ~11 forward planJourney calls (log2 of the search window in minutes) instead of
+// one; accepted as the simpler-to-get-correct tradeoff, matching this file's existing
+// CSA-over-RAPTOR rationale.
+const ARRIVE_BY_STEP_MS = 60 * 1000; // minute-granularity search, matching this planner's own display precision
+
+export function planJourneyArrivingBy({
+  origin, destination, arriveByEpochMs, schedules, stopRegistry, capMinutes = DEFAULT_WALK_CAP_MINUTES,
+}) {
+  function attempt(departureEpochMs) {
+    const result = planJourney({ origin, destination, departureEpochMs, schedules, stopRegistry, capMinutes });
+    const arrivalEpochMs = result.ok ? departureEpochMs + result.totalMinutes * 60000 : Infinity;
+    return { result, arrivalEpochMs };
+  }
+
+  // Restricted to departures on the SAME Melbourne calendar day as the target arrival
+  // (from local midnight up to the target time), not an arbitrary lookback window. This
+  // isn't just a scope simplification — it's what keeps the binary search below correct.
+  // The non-decreasing-arrival property above only holds while queryDate(t) — and
+  // therefore the exact connections array planJourney filters — stays fixed. Once a
+  // search window crosses local midnight, buildConnections rebuilds against a different
+  // D/D-1 pair per candidate t, and a recurring daily service can make "still reachable"
+  // flip true/false/true as t increases, which breaks binary search's core assumption
+  // (confirmed by hand-tracing a 24h-lookback version against this file's synthetic
+  // weekday fixture before landing on this same-day bound instead). Practical effect: an
+  // overnight trip (e.g. depart 11pm, arrive by 6am) needs the query framed as arriving
+  // "tomorrow", not a lookback past midnight from an evening departure.
+  const { seconds: targetSeconds } = melbourneDateAndSeconds(arriveByEpochMs);
+  const hiMin = Math.floor(arriveByEpochMs / ARRIVE_BY_STEP_MS);
+  const loMin = hiMin - Math.floor(targetSeconds / 60);
+
+  // A failure here that isn't time-dependent (no walkable stop at all near the origin or
+  // destination) will fail identically at every departure time in the window — surface
+  // that specific reason immediately rather than a generic "unreachable".
+  const hiAttempt = attempt(hiMin * ARRIVE_BY_STEP_MS);
+  if (!hiAttempt.result.ok && hiAttempt.result.reason === 'no_walkable_stops') return hiAttempt.result;
+
+  let lo = loMin;
+  let hi = hiMin;
+  let bestMin = null;
+  let bestResult = null;
+  while (lo <= hi) {
+    const mid = lo + Math.floor((hi - lo) / 2);
+    const { result, arrivalEpochMs } = attempt(mid * ARRIVE_BY_STEP_MS);
+    if (arrivalEpochMs <= arriveByEpochMs) {
+      bestMin = mid;
+      bestResult = result;
+      lo = mid + 1; // this departure works — try a later (closer to the target) one
+    } else {
+      hi = mid - 1; // too late to arrive in time — try an earlier departure
+    }
+  }
+
+  if (bestMin === null) {
+    return { ok: false, reason: 'unreachable_by_target' };
+  }
+  return { ...bestResult, requestedArriveBy: formatTimeOfDay(targetSeconds) };
+}

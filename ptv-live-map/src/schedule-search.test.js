@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { melbourneDateAndSeconds, planJourney } from './schedule-search.js';
+import { melbourneDateAndSeconds, planJourney, planJourneyArrivingBy } from './schedule-search.js';
 
 // ---------------------------------------------------------------------------
 // melbourneDateAndSeconds — DST boundary tests.
@@ -245,5 +245,97 @@ describe('planJourney — midnight rollover (GTFS >24h overflow times)', () => {
       stopRegistry,
     });
     expect(result.ok).toBe(false);
+  });
+});
+
+describe('planJourneyArrivingBy', () => {
+  // Local midnight on 2026-08-05 (winter, fixed UTC+10 — see melbourneDateAndSeconds
+  // tests above for why winter dates are used to sidestep unrelated DST edge cases here).
+  const arriveBy = (hh, mm) => Date.UTC(2026, 7, 4, hh - 10, mm, 0);
+
+  it('finds the latest departure that still arrives by the target, when the target exactly matches the only achievable arrival', () => {
+    const result = planJourneyArrivingBy({
+      origin: { lat: S1.lat, lon: S1.lon },
+      destination: { lat: S3.lat, lon: S3.lon },
+      arriveByEpochMs: arriveBy(8, 25), // exactly matches T1->T2's 08:25 arrival
+      schedules: [{ mode: 'train', data: baseScheduleData() }],
+      stopRegistry,
+    });
+    expect(result.ok).toBe(true);
+    // Departing any later than 08:00 misses T1 entirely (the only route to S3 in this
+    // fixture), so 08:00 — T1's own departure — is the latest still-workable departure.
+    expect(result.legs[0].boardTime).toBe('08:00');
+    expect(result.arriveBy).toBe('08:25');
+    expect(result.requestedArriveBy).toBe('08:25');
+  });
+
+  it('is unreachable when the target arrival is before the only achievable arrival', () => {
+    const result = planJourneyArrivingBy({
+      origin: { lat: S1.lat, lon: S1.lon },
+      destination: { lat: S3.lat, lon: S3.lon },
+      arriveByEpochMs: arriveBy(8, 24), // one minute before the earliest possible arrival
+      schedules: [{ mode: 'train', data: baseScheduleData() }],
+      stopRegistry,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('unreachable_by_target');
+  });
+
+  it('is unreachable when the target is before the network\'s first trip even departs', () => {
+    const result = planJourneyArrivingBy({
+      origin: { lat: S1.lat, lon: S1.lon },
+      destination: { lat: S3.lat, lon: S3.lon },
+      arriveByEpochMs: arriveBy(7, 0), // T1 doesn't depart until 08:00
+      schedules: [{ mode: 'train', data: baseScheduleData() }],
+      stopRegistry,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('unreachable_by_target');
+  });
+
+  it('a generous target still resolves to the same actual (earliest possible) arrival, not the target itself', () => {
+    const result = planJourneyArrivingBy({
+      origin: { lat: S1.lat, lon: S1.lon },
+      destination: { lat: S3.lat, lon: S3.lon },
+      arriveByEpochMs: arriveBy(9, 0), // an hour later than necessary
+      schedules: [{ mode: 'train', data: baseScheduleData() }],
+      stopRegistry,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.arriveBy).toBe('08:25'); // this fixture has no later alternative departure
+    expect(result.requestedArriveBy).toBe('09:00');
+  });
+
+  it('propagates a time-independent failure (no walkable stop at all) immediately, not as "unreachable"', () => {
+    // findWalkableStops falls back to the single nearest stop (however far) rather than
+    // returning empty when nothing is within the cap — 'no_walkable_stops' only actually
+    // fires when the stop registry itself has nothing in it at all.
+    const result = planJourneyArrivingBy({
+      origin: { lat: S1.lat, lon: S1.lon },
+      destination: { lat: S3.lat, lon: S3.lon },
+      arriveByEpochMs: arriveBy(8, 25),
+      schedules: [{ mode: 'train', data: baseScheduleData() }],
+      stopRegistry: {},
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('no_walkable_stops');
+  });
+
+  it('never returns a journey that actually arrives after the requested target', () => {
+    // Property-style sweep across several targets, including ones with no achievable
+    // journey at all.
+    [arriveBy(8, 10), arriveBy(8, 25), arriveBy(8, 30), arriveBy(12, 0)].forEach((target) => {
+      const result = planJourneyArrivingBy({
+        origin: { lat: S1.lat, lon: S1.lon },
+        destination: { lat: S3.lat, lon: S3.lon },
+        arriveByEpochMs: target,
+        schedules: [{ mode: 'train', data: baseScheduleData() }],
+        stopRegistry,
+      });
+      if (!result.ok) return;
+      // Both are same-day "HH:MM" strings (planJourneyArrivingBy only searches within
+      // the target's own calendar day), so comparing as minutes-of-day is safe here.
+      expect(parseHHMM(result.arriveBy)).toBeLessThanOrEqual(parseHHMM(result.requestedArriveBy));
+    });
   });
 });
