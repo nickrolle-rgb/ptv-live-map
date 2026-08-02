@@ -16,20 +16,43 @@ import { haversineKm } from './geo.js';
 // label it as approximate, not as turn-by-turn.
 export const WALK_SPEED_KMH = 4.8;
 export const WALK_CIRCUITY = 1.3;
-export const DEFAULT_WALK_CAP_MINUTES = 10;
+// 10 min (real-world use, 2026-08-02: a straight-line 1.0km station — genuinely
+// walkable — was landing at ~16.25 min once circuity is applied, and getting excluded
+// entirely) covers only ~0.6km straight-line; 20 min covers ~1.23km, which comfortably
+// includes that case with some margin.
+export const DEFAULT_WALK_CAP_MINUTES = 20;
 
 export function walkingMinutesTo(lat1, lon1, lat2, lon2) {
   const straightKm = haversineKm(lat1, lon1, lat2, lon2);
   return ((straightKm * WALK_CIRCUITY) / WALK_SPEED_KMH) * 60;
 }
 
-// Some GTFS stops.txt exports include internal wayfinding nodes at complex stations
-// (lift/stair access points, concourse "decision points") alongside real boarding
-// stops — not something a rider would ever board a service at. Best-effort filter
-// based on patterns actually observed in this app's stop data, not exhaustive; these
-// entries never appear as a real stop_id in live trip-updates either, so excluding
-// them here can't affect journey-matching accuracy (Phase 3), only display clutter.
-const NON_BOARDING_STOP_PATTERN = /decision point|\bdp\s?\d+\b|\blift\b|\bconcourse\b/i;
+// Some GTFS stops.txt exports include internal wayfinding/amenity nodes at complex
+// stations (lift/stair access points, concourse "decision points", park & ride lots)
+// alongside real boarding stops — not something a rider would ever board a service at.
+// Best-effort filter based on patterns actually observed in this app's stop data, not
+// exhaustive.
+//
+// This is not just display clutter to trim: these names are frequently reused verbatim
+// across dozens of unrelated stations statewide (confirmed against the bundled data —
+// "Park & Ride" alone spans ~95 physical locations, "Decision point 1" ~120), and
+// findWalkableStops below groups purely by exact name match with no distance sanity
+// check — a real design tradeoff for genuinely same-named multi-platform stations
+// (e.g. every "Flinders Street Station" platform), but one that silently merges these
+// generic names into a single fake "nearby" stop otherwise, whose stopIds then get
+// treated by callers (this function's own seeding, plus schedule-search.js's CSA
+// search) as reachable within the *nearest* instance's walk time — even though most of
+// the merged stop_ids are actually hundreds of kilometers away. An unfiltered generic
+// name can therefore make the planner believe a distant, unrelated station is a
+// 17-minute walk away, not just add noise to a display list.
+//
+// Known gap, deliberately not addressed here: real (boardable) stops that coincidentally
+// share a common street name across different suburbs — e.g. "Station St" — hit this
+// same merge-by-name flaw but aren't amenity points, so they can't be filtered out by a
+// name pattern. Fixing that properly needs geography-aware grouping (only merge
+// same-named entries that are also physically close), not a blocklist; flagged as a
+// separate, larger follow-up rather than folded into this list.
+const NON_BOARDING_STOP_PATTERN = /decision point|\bdp\s?\d+\b|\blift\b|\bconcourse\b|park\s*&\s*ride|bike\s*&\s*ride|kiss\s*&\s*ride|taxi\s*zone/i;
 
 // stopTables: [{ mode, stopNames }], stopNames shaped stopId -> [name, lat, lon] (the
 // same tables MODES[mode].stopNames already provides in main.js) — passed in rather

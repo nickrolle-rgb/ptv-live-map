@@ -42,15 +42,17 @@ describe('melbourneDateAndSeconds — DST boundaries', () => {
 // ---------------------------------------------------------------------------
 // planJourney — synthetic network fixtures.
 //
-// A minimal three/four-stop network laid out with real lat/lon deltas (0.01 deg
-// latitude =~ 1.11km) so findWalkableStops' walking-cap logic behaves realistically,
-// not just algorithmically. Stop naming ("Mid Interchange" shared by S2/S2B) exists
-// specifically to exercise buildInterchangeGroups' same-name transfer modelling.
+// A minimal three/four-stop network laid out with real lat/lon deltas (0.03 deg
+// latitude =~ 3.34km, comfortably past DEFAULT_WALK_CAP_MINUTES's ~1.23km reach — see
+// journey.js — so adjacent stops require an actual trip, not a walk) so
+// findWalkableStops' walking-cap logic behaves realistically, not just algorithmically.
+// Stop naming ("Mid Interchange" shared by S2/S2B) exists specifically to exercise
+// buildInterchangeGroups' same-name transfer modelling.
 // ---------------------------------------------------------------------------
 const S1 = { id: 'S1', name: 'Origin Stop', lat: -37.80000, lon: 144.95000 };
-const S2 = { id: 'S2', name: 'Mid Interchange', lat: -37.81000, lon: 144.95000 };
-const S2B = { id: 'S2B', name: 'Mid Interchange', lat: -37.81001, lon: 144.95001 }; // ~1.5m from S2
-const S3 = { id: 'S3', name: 'Dest Stop', lat: -37.82000, lon: 144.95000 };
+const S2 = { id: 'S2', name: 'Mid Interchange', lat: -37.83000, lon: 144.95000 };
+const S2B = { id: 'S2B', name: 'Mid Interchange', lat: -37.83001, lon: 144.95001 }; // ~1.5m from S2
+const S3 = { id: 'S3', name: 'Dest Stop', lat: -37.86000, lon: 144.95000 };
 
 const stopRegistry = Object.fromEntries(
   [S1, S2, S2B, S3].map((s) => [s.id, [s.name, s.lat, s.lon]])
@@ -143,7 +145,7 @@ describe('planJourney — interchange walk-distance cap', () => {
     const farData = baseScheduleData();
     const farRegistry = {
       ...stopRegistry,
-      S2B: ['Mid Interchange', -37.95000, 144.95000], // ~16.7km from S2 — far beyond any walkable interchange
+      S2B: ['Mid Interchange', -37.95000, 144.95000], // ~13.3km from S2 — far beyond any walkable interchange
     };
     const result = planJourney({
       origin: { lat: S1.lat, lon: S1.lon },

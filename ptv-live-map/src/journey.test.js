@@ -38,6 +38,11 @@ describe('findWalkableStops', () => {
         far: ['Far Station', -38.5000, 145.5000],
         dp: ['Near Station - Decision Point 1', -37.8137, 144.9632],
         lift: ['Near Station Lift', -37.8138, 144.9633],
+        pr1: ['Park & Ride', -37.8139, 144.9634], // near the origin...
+        pr2: ['Park & Ride', -38.5000, 145.5000], // ...but this same-named one is at "Far Station", not nearby
+        bike: ['Bike & Ride 1', -37.8140, 144.9635],
+        kiss: ['Kiss & Ride', -37.8141, 144.9636],
+        taxi: ['Taxi Zone', -37.8142, 144.9637],
       },
     },
   ];
@@ -60,11 +65,26 @@ describe('findWalkableStops', () => {
     expect(near.stopIds.sort()).toEqual(['near1', 'near2']);
   });
 
-  it('filters out non-boarding wayfinding nodes (decision points, lifts, concourses)', () => {
+  it('filters out non-boarding wayfinding/amenity nodes (decision points, lifts, park & ride, bike & ride, kiss & ride, taxi zones)', () => {
     const result = findWalkableStops(origin.lat, origin.lon, stopTables, { capMinutes: DEFAULT_WALK_CAP_MINUTES });
     const names = result.stops.map((s) => s.name);
     expect(names).not.toContain('Near Station - Decision Point 1');
     expect(names).not.toContain('Near Station Lift');
+    expect(names).not.toContain('Park & Ride');
+    expect(names).not.toContain('Bike & Ride 1');
+    expect(names).not.toContain('Kiss & Ride');
+    expect(names).not.toContain('Taxi Zone');
+  });
+
+  it('regression: a generic amenity name reused at a far-away station is excluded entirely, not merged as a false-nearby stop', () => {
+    // Before NON_BOARDING_STOP_PATTERN covered "Park & Ride", the group-by-exact-name
+    // logic below would have merged pr1 (near the origin) and pr2 (at "Far Station",
+    // ~85km away) into one entry — reporting pr1's ~0-minute distance while quietly
+    // including pr2's stop_id as if it were equally walkable. Filtering both out
+    // entirely is what prevents that, not the walk cap.
+    const result = findWalkableStops(origin.lat, origin.lon, stopTables, { capMinutes: DEFAULT_WALK_CAP_MINUTES });
+    const parkAndRide = result.stops.find((s) => s.name === 'Park & Ride');
+    expect(parkAndRide).toBeUndefined();
   });
 
   it('falls back to the single nearest stop, flagged withinCap:false, when nothing is within the cap', () => {
