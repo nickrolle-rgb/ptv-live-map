@@ -2155,13 +2155,32 @@ function renderJourneyPanel() {
   renderJourneyWalkSection('Stops near your destination', destWalk);
 }
 
-function initJourneyPanel() {
-  function setJourneyPanelOpen(open) {
-    journeyPanelEl.classList.toggle('open', open);
-    journeyToggleButton.classList.toggle('open', open);
-    journeyToggleButton.setAttribute('aria-expanded', String(open));
-    if (open) renderJourneyPanel();
+// Only one of the route-picker panel and the journey panel may be open at a time —
+// opening either one closes the other first. Declared at module scope (not nested
+// inside initRoutePicker/initJourneyPanel) so each can call the other; the mutual call
+// only ever fires on the *opening* branch, never on close, so there's no risk of the two
+// re-triggering each other back and forth.
+function setPanelOpen(open) {
+  panel.classList.toggle('open', open);
+  toggleButton.classList.toggle('open', open);
+  toggleButton.setAttribute('aria-expanded', String(open));
+  if (open) {
+    setJourneyPanelOpen(false);
+    if (activePane === 'discovery') switchPane('discovery');
   }
+}
+
+function setJourneyPanelOpen(open) {
+  journeyPanelEl.classList.toggle('open', open);
+  journeyToggleButton.classList.toggle('open', open);
+  journeyToggleButton.setAttribute('aria-expanded', String(open));
+  if (open) {
+    setPanelOpen(false);
+    renderJourneyPanel();
+  }
+}
+
+function initJourneyPanel() {
   journeyToggleButton.addEventListener('click', () => setJourneyPanelOpen(!journeyPanelEl.classList.contains('open')));
   journeyCloseButton.addEventListener('click', () => setJourneyPanelOpen(false));
 
@@ -2230,12 +2249,6 @@ function initRoutePicker() {
   buildRouteListSkeleton();
   renderRoutePicker();
 
-  function setPanelOpen(open) {
-    panel.classList.toggle('open', open);
-    toggleButton.classList.toggle('open', open);
-    toggleButton.setAttribute('aria-expanded', String(open));
-    if (open && activePane === 'discovery') switchPane('discovery');
-  }
   toggleButton.addEventListener('click', () => setPanelOpen(!panel.classList.contains('open')));
   closeButton.addEventListener('click', () => setPanelOpen(false));
 
