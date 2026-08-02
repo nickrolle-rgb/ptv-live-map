@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { melbourneDateAndSeconds, planJourney, planJourneyArrivingBy } from './schedule-search.js';
+import { melbourneDateAndSeconds, melbourneWallClockToEpochMs, planJourney, planJourneyArrivingBy } from './schedule-search.js';
 
 // ---------------------------------------------------------------------------
 // melbourneDateAndSeconds — DST boundary tests.
@@ -36,6 +36,45 @@ describe('melbourneDateAndSeconds — DST boundaries', () => {
     // 2026-08-05T00:05:00 local (Melbourne winter, fixed UTC+10) == 2026-08-04T14:05:00Z
     const result = melbourneDateAndSeconds(Date.UTC(2026, 7, 4, 14, 5, 0));
     expect(result).toEqual({ dateStr: '20260805', seconds: 5 * 60 });
+  });
+});
+
+describe('melbourneWallClockToEpochMs — inverse of melbourneDateAndSeconds', () => {
+  it('round-trips a plain winter instant', () => {
+    const epochMs = melbourneWallClockToEpochMs('20260805', 5 * 60);
+    expect(epochMs).toBe(Date.UTC(2026, 7, 4, 14, 5, 0));
+    expect(melbourneDateAndSeconds(epochMs)).toEqual({ dateStr: '20260805', seconds: 5 * 60 });
+  });
+
+  it('round-trips a summer (AEDT, UTC+11) instant', () => {
+    // Mid-January is unambiguously AEDT — a good sanity check independent of either
+    // transition date.
+    const epochMs = melbourneWallClockToEpochMs('20260115', 12 * 3600);
+    expect(melbourneDateAndSeconds(epochMs)).toEqual({ dateStr: '20260115', seconds: 12 * 3600 });
+  });
+
+  it('resolves wall-clock times either side of the spring-forward gap to their real, hour-apart instants', () => {
+    // 01:30 AEST and 03:10 AEDT look 100 minutes apart by raw digits, but the 02:00-03:00
+    // hour never happened locally on 2026-10-04 (see the DST-boundary tests above), so
+    // they're really only 40 real minutes apart.
+    const departEpochMs = melbourneWallClockToEpochMs('20261004', 1 * 3600 + 30 * 60); // 01:30
+    const arriveEpochMs = melbourneWallClockToEpochMs('20261004', 3 * 3600 + 10 * 60); // 03:10
+    expect(departEpochMs).toBe(Date.UTC(2026, 9, 3, 15, 30, 0));
+    expect(arriveEpochMs).toBe(Date.UTC(2026, 9, 3, 16, 10, 0));
+    expect((arriveEpochMs - departEpochMs) / 60000).toBe(40);
+  });
+
+  it('resolves the fall-back date\'s wall-clock times to the second (AEST) occurrence of the repeated hour', () => {
+    // 02:30 on 2026-04-05 happens twice (02:30 AEDT, then again as 02:30 AEST an hour
+    // later). This function can't disambiguate from naive GTFS seconds-since-midnight
+    // alone (see its header) and always resolves to the later, AEST occurrence — its
+    // initial guess assumes AEST and, for a target in this window, already reads back
+    // correctly with no correction needed.
+    const epochMs = melbourneWallClockToEpochMs('20260405', 2 * 3600 + 30 * 60);
+    expect(melbourneDateAndSeconds(epochMs)).toEqual({ dateStr: '20260405', seconds: 2 * 3600 + 30 * 60 });
+    // The AEDT occurrence is Date.UTC(2026,3,4,15,30,0); this resolves to the AEST one,
+    // an hour later.
+    expect(epochMs).toBe(Date.UTC(2026, 3, 4, 16, 30, 0));
   });
 });
 
@@ -137,6 +176,129 @@ describe('planJourney — basic direct + transfer routing', () => {
       });
       expect(result.totalMinutes).toBeGreaterThanOrEqual(0);
     });
+  });
+});
+
+describe('planJourney — same-trip pass-through (rider stays aboard through an intermediate stop)', () => {
+  // Every other synthetic fixture in this file uses 2-stop trips, so none of them
+  // exercise the `last.tripId === hop.tripId` merge branch in planJourney's leg-building
+  // loop — the mechanism that keeps a rider staying aboard through an intermediate
+  // boardable stop from being reported as two legs with a phantom transfer at that stop.
+  const P1 = { id: 'P1', name: 'Pass Origin', lat: -37.80000, lon: 144.95000 };
+  const PM = { id: 'PM', name: 'Pass Mid', lat: -37.83000, lon: 144.95000 }; // boardable, but nobody transfers here
+  const P3 = { id: 'P3', name: 'Pass Dest', lat: -37.86000, lon: 144.95000 };
+  const passRegistry = Object.fromEntries([P1, PM, P3].map((s) => [s.id, [s.name, s.lat, s.lon]]));
+
+  const data = {
+    stopIds: ['P1', 'PM', 'P3'],
+    routeIds: ['R1'],
+    serviceIds: ['WEEKDAY'],
+    trips: {
+      // Single trip, three stops: depart P1 08:00, through PM (arrive 08:10, depart
+      // 08:11), arrive P3 08:20. No transfer/interchange involved anywhere in this.
+      T1: { r: 0, s: 0, stops: [[0, null, 8 * 3600], [1, 8 * 3600 + 600, 8 * 3600 + 660], [2, 8 * 3600 + 1200, null]] },
+    },
+    calendar: { WEEKDAY: WEEKDAY_CAL },
+    calendarDates: {},
+  };
+
+  it('merges the ride through an intermediate boardable stop into a single leg, not two', () => {
+    const result = planJourney({
+      origin: { lat: P1.lat, lon: P1.lon },
+      destination: { lat: P3.lat, lon: P3.lon },
+      departureEpochMs: QUERY_BEFORE_0800,
+      schedules: [{ mode: 'train', data }],
+      stopRegistry: passRegistry,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.legs).toHaveLength(1);
+    expect(result.legs[0].tripId).toBe('T1');
+    expect(result.legs[0].boardStop).toBe('Pass Origin');
+    expect(result.legs[0].boardTime).toBe('08:00');
+    expect(result.legs[0].alightStop).toBe('Pass Dest');
+    expect(result.legs[0].alightTime).toBe('08:20');
+    // No transfer happened (only one leg) — must not report a phantom wait/transfer at
+    // the intermediate stop, and that stop must not leak in as its own board/alight point.
+    expect(result.legs[0].transferMinutes).toBeNull();
+    expect(result.legs.some((leg) => leg.boardStop === 'Pass Mid' || leg.alightStop === 'Pass Mid')).toBe(false);
+    expect(result.totalMinutes).toBe(35); // 07:45 query -> 08:20 real, no lost time
+  });
+});
+
+describe('planJourney — multi-leg reconstruction (predecessor overwrite mid-sweep)', () => {
+  // Regression coverage for the prevHop-snapshot mechanism documented at length in
+  // schedule-search.js (the "Two different connections can each legitimately improve
+  // the other's stop" comment on the backtrack site). A literal mutual A<->B cycle
+  // isn't actually constructible under real forward-flowing GTFS times (a connection
+  // back from B to A can never arrive earlier than an already-recorded arrival at A,
+  // since that would require negative travel time) — but the *mechanism* the comment
+  // guards against — a stop's predecessor entry being overwritten mid-sweep by a
+  // better connection, where the earlier entry already seeded a later hop's prevHop
+  // snapshot — is directly constructible and exactly what this test forces:
+  //
+  //   T1 (S4->A, slow direct)         depart 08:00  arrive 08:20
+  //   T2a (S4->M, fast alternative)    depart 07:55  arrive 08:05
+  //   T2b (M->A, fast alternative)     depart 08:08  arrive 08:15  <- beats T1, overwrites predecessor[A]
+  //   T3 (A->S5, onward leg)           depart 08:20  arrive 08:30
+  //
+  // T3's prevHop is captured *after* T2b's overwrite, so reconstruction must walk
+  // S4->M->A->S5 (3 legs, all via the fast path) with no trace of T1's now-discarded
+  // direct hop — not a truncated or mixed chain.
+  const M = { id: 'M', name: 'Mid Stop', lat: -37.81500, lon: 144.95000 };
+  const S4 = { id: 'S4', name: 'Multi Origin', lat: -37.80000, lon: 144.95000 };
+  const A = { id: 'A', name: 'Junction Stop', lat: -37.83000, lon: 144.95000 };
+  const S5 = { id: 'S5', name: 'Multi Dest', lat: -37.86000, lon: 144.95000 };
+  const fullRegistry = Object.fromEntries(
+    [S4, M, A, S5].map((s) => [s.id, [s.name, s.lat, s.lon]])
+  );
+
+  const data = {
+    stopIds: ['S4', 'M', 'A', 'S5'],
+    routeIds: ['SLOW', 'FAST1', 'FAST2', 'ONWARD'],
+    serviceIds: ['WEEKDAY'],
+    trips: {
+      // S4 -> A direct, slow: depart 08:00, arrive 08:20.
+      T1_SLOW: { r: 0, s: 0, stops: [[0, null, 8 * 3600], [2, 8 * 3600 + 1200, null]] },
+      // S4 -> M, depart 07:55, arrive 08:05.
+      T2A_FAST: { r: 1, s: 0, stops: [[0, null, 8 * 3600 - 300], [1, 8 * 3600 + 300, null]] },
+      // M -> A, depart 08:08, arrive 08:15 — beats T1_SLOW's 08:20.
+      T2B_FAST: { r: 2, s: 0, stops: [[1, null, 8 * 3600 + 480], [2, 8 * 3600 + 900, null]] },
+      // A -> S5 onward leg, depart 08:20, arrive 08:30.
+      T3_ONWARD: { r: 3, s: 0, stops: [[2, null, 8 * 3600 + 1200], [3, 8 * 3600 + 1800, null]] },
+    },
+    calendar: { WEEKDAY: WEEKDAY_CAL },
+    calendarDates: {},
+  };
+
+  it('reconstructs the full 3-leg chain via the faster path once a mid-sweep predecessor overwrite occurs', () => {
+    const result = planJourney({
+      origin: { lat: S4.lat, lon: S4.lon },
+      destination: { lat: S5.lat, lon: S5.lon },
+      departureEpochMs: QUERY_BEFORE_0800,
+      schedules: [{ mode: 'train', data }],
+      stopRegistry: fullRegistry,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.legs).toHaveLength(3);
+    expect(result.legs[0].boardStop).toBe('Multi Origin');
+    expect(result.legs[0].alightStop).toBe('Mid Stop');
+    expect(result.legs[0].boardTime).toBe('07:55');
+    expect(result.legs[0].alightTime).toBe('08:05');
+    expect(result.legs[1].boardStop).toBe('Mid Stop');
+    expect(result.legs[1].alightStop).toBe('Junction Stop');
+    expect(result.legs[1].boardTime).toBe('08:08');
+    expect(result.legs[1].alightTime).toBe('08:15');
+    expect(result.legs[2].boardStop).toBe('Junction Stop');
+    expect(result.legs[2].alightStop).toBe('Multi Dest');
+    expect(result.legs[2].boardTime).toBe('08:20');
+    expect(result.legs[2].alightTime).toBe('08:30');
+    // The now-discarded slow direct trip must leave no trace in the reconstructed legs.
+    expect(result.legs.some((leg) => leg.tripId === 'T1_SLOW')).toBe(false);
+    // arriveBy/totalMinutes (computed independently from earliestArrival) must agree
+    // exactly with what the displayed legs show — the precise invariant the real bug
+    // this mechanism guards against violated (a duration the legs didn't account for).
+    expect(result.arriveBy).toBe('08:30');
+    expect(result.totalMinutes).toBe(45); // query at 07:45 -> arrive 08:30
   });
 });
 
@@ -247,6 +409,66 @@ describe('planJourney — midnight rollover (GTFS >24h overflow times)', () => {
       stopRegistry,
     });
     expect(result.ok).toBe(false);
+  });
+});
+
+describe('planJourney / planJourneyArrivingBy — journeys spanning the spring-forward DST transition', () => {
+  const D1 = { id: 'D1', name: 'DST Origin', lat: -37.80000, lon: 144.95000 };
+  const D2 = { id: 'D2', name: 'DST Dest', lat: -37.86000, lon: 144.95000 };
+  const dstRegistry = Object.fromEntries([D1, D2].map((s) => [s.id, [s.name, s.lat, s.lon]]));
+  const SUNDAY_CAL = { days: [0, 0, 0, 0, 0, 0, 1], start: '20260101', end: '20261231' }; // Sunday only
+
+  const dstData = {
+    stopIds: ['D1', 'D2'],
+    routeIds: ['R1'],
+    serviceIds: ['SUN'],
+    trips: {
+      // Scheduled local wall-clock: depart 01:30, arrive 03:10. 2026-10-04 is the
+      // spring-forward Sunday (see the DST-boundary tests above), so this window fully
+      // contains the missing 02:00-03:00 hour — real elapsed time is 40 minutes
+      // (15:30Z -> 16:10Z), not the 100 minutes these raw digits naively imply.
+      T1: { r: 0, s: 0, stops: [[0, null, 1 * 3600 + 1800], [1, 3 * 3600 + 600, null]] },
+    },
+    calendar: { SUN: SUNDAY_CAL },
+    calendarDates: {},
+  };
+  // Local midnight, 2026-10-04 (AEST still — the transition is later that morning).
+  const queryEpochMs = Date.UTC(2026, 9, 3, 14, 0, 0);
+
+  it('reports the real elapsed duration, not the raw wall-clock-digit difference', () => {
+    const result = planJourney({
+      origin: { lat: D1.lat, lon: D1.lon },
+      destination: { lat: D2.lat, lon: D2.lon },
+      departureEpochMs: queryEpochMs,
+      schedules: [{ mode: 'train', data: dstData }],
+      stopRegistry: dstRegistry,
+    });
+    expect(result.ok).toBe(true);
+    // Display strings still show plain wall-clock digits, as a real departure board would.
+    expect(result.legs[0].boardTime).toBe('01:30');
+    expect(result.legs[0].alightTime).toBe('03:10');
+    // Real elapsed time from local midnight (query) to 03:10 AEDT arrival: 90 real
+    // minutes to 01:30 (no DST involved yet) + 40 real minutes from 01:30 to 03:10
+    // (crossing the gap) = 130 -- not 190 (midnight-to-01:30's 90 + the naive 100-minute
+    // digit-diff for 01:30->03:10, which double-counts the lost hour).
+    expect(result.totalMinutes).toBe(130);
+    expect(result.arrivalEpochMs).toBe(Date.UTC(2026, 9, 3, 16, 10, 0));
+  });
+
+  it('planJourneyArrivingBy finds this trip reachable when the target is its real (not naively-computed) arrival instant', () => {
+    const realArrivalEpochMs = Date.UTC(2026, 9, 3, 16, 10, 0); // true instant of 03:10 AEDT
+    const result = planJourneyArrivingBy({
+      origin: { lat: D1.lat, lon: D1.lon },
+      destination: { lat: D2.lat, lon: D2.lon },
+      arriveByEpochMs: realArrivalEpochMs,
+      schedules: [{ mode: 'train', data: dstData }],
+      stopRegistry: dstRegistry,
+    });
+    // Before the arrivalEpochMs fix, this incorrectly reported 'unreachable_by_target':
+    // the old departureEpochMs + totalMinutes*60000 estimate overstated the arrival by
+    // the missing hour, pushing it past the target.
+    expect(result.ok).toBe(true);
+    expect(result.legs[0].tripId).toBe('T1');
   });
 });
 

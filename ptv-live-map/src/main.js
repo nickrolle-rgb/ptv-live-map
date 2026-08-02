@@ -3,7 +3,7 @@ import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 import { haversineKm } from './geo.js';
 import { findWalkableStops, DEFAULT_WALK_CAP_MINUTES } from './journey.js';
-import { pickNextStop, describeNextStop, STOP_SANITY_KM } from './stop-matching.js';
+import { pickNextStop, describeNextStop, positionStaleness, STOP_SANITY_KM } from './stop-matching.js';
 import trainRouteNames from './data/train-routes.json';
 import tramRouteNames from './data/tram-routes.json';
 import vlineRouteNames from './data/vline-routes.json';
@@ -34,11 +34,6 @@ const STATIONARY_AFTER_MS = 25000;
 // bigger dot competing with it. Also used for train/V-Line's resting (unoccupied) stop
 // circles, so a station already looks like a landing pad rather than growing into one.
 const STOP_OCCUPIED_RADIUS_PX = 11;
-// Real GPS fixes land every 20-60s+ in normal operation (see renderMarkers comment
-// below) — beyond this, the feed itself hasn't heard from the vehicle in a while, so
-// its plotted position is a guess rather than a live report and the popup says so
-// instead of presenting it with false confidence.
-const STALE_POSITION_MS = 3 * 60 * 1000;
 
 const MODES = {
   tram: { label: 'Trams', color: '#6b46c1', names: tramRouteNames, hasAlerts: true, shapes: tramShapes, stops: tramStops, stopNames: tramStopNames },
@@ -680,8 +675,7 @@ function buildPopupContent(v, info, bearing, moving) {
   // with no fresher fix to prove that). Rather than assert a specific station off data
   // we already know is too old to trust, drop the claim entirely and let the staleness
   // line below speak for itself.
-  const positionAgeMs = v.timestamp != null ? Date.now() - v.timestamp * 1000 : null;
-  const positionStale = positionAgeMs != null && positionAgeMs > STALE_POSITION_MS;
+  const { ageMs: positionAgeMs, stale: positionStale } = positionStaleness(v.timestamp, Date.now());
   const next = positionStale ? null : nextStopInfo(v.mode, v.tripId, v.lat, v.lon, v.region);
   if (next) {
     if (next.eta == null) parts.push(`${next.label}: ${next.name}`);

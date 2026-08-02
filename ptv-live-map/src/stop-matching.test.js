@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { pickNextStop, describeNextStop, STOP_SANITY_KM } from './stop-matching.js';
+import { pickNextStop, describeNextStop, positionStaleness, STALE_POSITION_MS, STOP_SANITY_KM } from './stop-matching.js';
 
 // A straight, evenly-spaced train line for boundary testing:
 // StopA --- (0.5km) --- StopB --- (0.5km) --- StopC
@@ -77,6 +77,24 @@ describe('pickNextStop', () => {
     expect(pickNextStop(resolved, stopA.lat, stopA.lon, STOP_SANITY_KM.train)).not.toBeNull();
     expect(pickNextStop(resolved, stopA.lat, stopA.lon, STOP_SANITY_KM.tram)).toBeNull();
   });
+
+  it('regression: a NaN-distance candidate (malformed coordinate) never wins by default, even when listed first', () => {
+    // Before the Number.isFinite guard, `NaN > sanity.next` and `distanceKm <
+    // best.distanceKm` are both false — so a NaN candidate landing first satisfied
+    // `!best`, locked in as "best" with distanceKm: NaN, and no later valid candidate
+    // could ever displace it (every comparison against NaN is false).
+    const nanStop = { name: 'Malformed Stop', lat: NaN, lon: NaN };
+    const resolved = [candidate(nanStop), candidate(stopA)];
+    const best = pickNextStop(resolved, stopA.lat, stopA.lon, sanity);
+    expect(best.stop.name).toBe('Stop A');
+    expect(Number.isFinite(best.distanceKm)).toBe(true);
+  });
+
+  it('returns null when every candidate has a NaN distance, rather than surfacing one', () => {
+    const nanStop = { name: 'Malformed Stop', lat: NaN, lon: NaN };
+    const resolved = [candidate(nanStop)];
+    expect(pickNextStop(resolved, stopA.lat, stopA.lon, sanity)).toBeNull();
+  });
 });
 
 describe('describeNextStop', () => {
@@ -128,5 +146,63 @@ describe('describeNextStop', () => {
 
   it('returns null when there is no matching candidate at all', () => {
     expect(describeNextStop(null, sanity, nowMs)).toBeNull();
+  });
+});
+
+describe('positionStaleness', () => {
+  const nowMs = 1_000_000_000_000;
+  const nowSec = nowMs / 1000;
+
+  it('is not stale for a fresh timestamp (well under the threshold)', () => {
+    const result = positionStaleness(nowSec - 20, nowMs); // 20s old
+    expect(result.ageMs).toBe(20_000);
+    expect(result.stale).toBe(false);
+  });
+
+  it('is stale for a timestamp well past the threshold', () => {
+    const result = positionStaleness(nowSec - 10 * 60, nowMs); // 10 min old
+    expect(result.ageMs).toBe(10 * 60 * 1000);
+    expect(result.stale).toBe(true);
+  });
+
+  it('is not stale exactly at the threshold (strictly greater-than, not greater-or-equal)', () => {
+    const result = positionStaleness(nowSec - STALE_POSITION_MS / 1000, nowMs);
+    expect(result.ageMs).toBe(STALE_POSITION_MS);
+    expect(result.stale).toBe(false);
+  });
+
+  it('is stale one second past the threshold', () => {
+    const result = positionStaleness(nowSec - STALE_POSITION_MS / 1000 - 1, nowMs);
+    expect(result.stale).toBe(true);
+  });
+
+  it('reports null age (and never stale) when there is no timestamp at all', () => {
+    const result = positionStaleness(null, nowMs);
+    expect(result.ageMs).toBeNull();
+    expect(result.stale).toBe(false);
+  });
+
+  it('reports null age (and never stale) when the timestamp is undefined', () => {
+    const result = positionStaleness(undefined, nowMs);
+    expect(result.ageMs).toBeNull();
+    expect(result.stale).toBe(false);
+  });
+
+  it('is not stale for a future timestamp (clock skew), even though the age is negative', () => {
+    // A vehicle-position timestamp slightly ahead of this client's clock (feed server
+    // vs. browser skew) must not be misreported as stale — a negative age is "fresher
+    // than now", the opposite problem, and positionStale's `> STALE_POSITION_MS` check
+    // already handles this correctly, but pin it down explicitly since a naive
+    // Math.abs(ageMs) "fix" would silently break this instead.
+    const result = positionStaleness(nowSec + 30, nowMs); // 30s in the future
+    expect(result.ageMs).toBe(-30_000);
+    expect(result.stale).toBe(false);
+  });
+
+  it('defaults nowMs to Date.now() when omitted', () => {
+    const result = positionStaleness(Date.now() / 1000);
+    expect(result.stale).toBe(false);
+    expect(result.ageMs).toBeGreaterThanOrEqual(0);
+    expect(result.ageMs).toBeLessThan(1000);
   });
 });

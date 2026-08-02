@@ -75,6 +75,44 @@ export function melbourneDateAndSeconds(epochMs) {
   return { dateStr, seconds };
 }
 
+// Inverse of melbourneDateAndSeconds: resolves a Melbourne-local calendar date plus
+// GTFS-style seconds-since-midnight (0..86399, or beyond for >24h overflow trips) back
+// to the real epoch instant it represents. Needed because stop_times.txt (and this
+// file's own connections timeline, built from it) is written in naive wall-clock
+// seconds — one flat 86400s per calendar day — which silently diverges from real
+// elapsed time on the two Melbourne DST-transition days each year. Everywhere that
+// divergence is harmless (CSA's internal ordering/comparisons stay self-consistent
+// since every value uses the same naive timeline; formatTimeOfDay's HH:MM display is
+// *supposed* to show local wall-clock digits regardless of DST), so this is only used
+// where a *real* elapsed duration or epoch instant is actually required — see
+// arrivalEpochMs below.
+//
+// Melbourne's DST is always a whole-hour, instantaneous-transition offset (UTC+10 AEST
+// / UTC+11 AEDT), so one correction pass suffices: guess the epoch assuming AEST, ask
+// melbourneDateAndSeconds what that guess actually reads as locally, and shift by
+// whatever error is observed (which, for any guess within the same or adjacent
+// calendar day as the target, can only ever be 0 or a whole number of hours).
+//
+// The one genuine ambiguity this can't resolve — GTFS wall-clock seconds can't
+// distinguish which occurrence is meant during the repeated hour on the April fall-back
+// date (02:00-03:00 happens twice, AEDT then AEST) — always resolves to the SECOND
+// (AEST) occurrence: the initial guess already assumes AEST, so for a target in that
+// repeated hour it reads back correctly immediately (errorSeconds is 0) and no
+// correction is ever applied, landing on the later of the two real instants.
+export function melbourneWallClockToEpochMs(dateStr, secondsOfDay) {
+  const y = Number(dateStr.slice(0, 4));
+  const m = Number(dateStr.slice(4, 6));
+  const d = Number(dateStr.slice(6, 8));
+  const utcMidnight = Date.UTC(y, m - 1, d);
+  let guess = utcMidnight + (secondsOfDay - 10 * 3600) * 1000; // assume AEST (UTC+10)
+  const actual = melbourneDateAndSeconds(guess);
+  const targetAbs = epochDay(dateStr) * SECONDS_PER_DAY + secondsOfDay;
+  const actualAbs = epochDay(actual.dateStr) * SECONDS_PER_DAY + actual.seconds;
+  const errorSeconds = targetAbs - actualAbs;
+  if (errorSeconds !== 0) guess += errorSeconds * 1000;
+  return guess;
+}
+
 function resolveActiveServices(scheduleData, dateStr) {
   const active = new Set();
   const dow = dayOfWeekIndex(dateStr);
@@ -351,7 +389,18 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
     };
   });
 
-  const totalMinutes = Math.round((bestArrival - queryAbs) / 60);
+  // totalMinutes deliberately does NOT come from (bestArrival - queryAbs) / 60 — both
+  // are naive wall-clock-digit seconds (see buildConnections/melbourneWallClockToEpochMs
+  // headers), and diffing them directly silently gains or loses an hour for any journey
+  // whose *scheduled* span crosses a Melbourne DST transition (confirmed: a real trip
+  // spanning 2026-10-04's spring-forward gap reported 190 minutes for what is actually a
+  // 130-minute wait+journey in real time). Converting the arrival's wall-clock reading
+  // back to a real epoch via melbourneWallClockToEpochMs and diffing that against the
+  // real departureEpochMs the caller supplied gives the true elapsed duration instead.
+  const arrivalDateStr = addDays(queryDate, Math.floor(bestArrival / SECONDS_PER_DAY));
+  const arrivalSecondsOfDay = ((bestArrival % SECONDS_PER_DAY) + SECONDS_PER_DAY) % SECONDS_PER_DAY;
+  const arrivalEpochMs = melbourneWallClockToEpochMs(arrivalDateStr, arrivalSecondsOfDay);
+  const totalMinutes = Math.round((arrivalEpochMs - departureEpochMs) / 60000);
 
   return {
     ok: true,
@@ -361,6 +410,7 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
     legs: legsOut,
     totalMinutes,
     arriveBy: formatTimeOfDay(bestArrival),
+    arrivalEpochMs,
   };
 }
 
@@ -382,7 +432,10 @@ export function planJourneyArrivingBy({
 }) {
   function attempt(departureEpochMs) {
     const result = planJourney({ origin, destination, departureEpochMs, schedules, stopRegistry, capMinutes });
-    const arrivalEpochMs = result.ok ? departureEpochMs + result.totalMinutes * 60000 : Infinity;
+    // Uses planJourney's own real-epoch arrivalEpochMs directly rather than
+    // re-deriving departureEpochMs + totalMinutes*60000 — that reconstruction is exactly
+    // what totalMinutes's own header warns against relying on for real-epoch math.
+    const arrivalEpochMs = result.ok ? result.arrivalEpochMs : Infinity;
     return { result, arrivalEpochMs };
   }
 

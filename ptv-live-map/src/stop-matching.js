@@ -43,6 +43,12 @@ export function pickNextStop(resolvedStops, vLat, vLon, sanity) {
     const { stop } = candidate;
     if (!stop) continue;
     const distanceKm = haversineKm(vLat, vLon, stop.lat, stop.lon);
+    // A NaN distance (malformed vehicle GPS or stop coordinate) must never win by
+    // default: `NaN > x` and `NaN < best.distanceKm` are both false, so without this
+    // guard a NaN candidate landing first in the list would satisfy `!best`, lock in as
+    // "best" with distanceKm: NaN, and then be un-overridable — every later, valid
+    // candidate would also fail `distanceKm < NaN`, leaving the NaN entry as the result.
+    if (!Number.isFinite(distanceKm)) continue;
     if (distanceKm > sanity.next) continue;
     if (!best || distanceKm < best.distanceKm) best = { ...candidate, distanceKm };
   }
@@ -64,4 +70,21 @@ export function describeNextStop(best, sanity, nowMs = Date.now()) {
   return etaSeconds == null
     ? { label: 'Next stop', name: stop.name, eta: null, lat: stop.lat, lon: stop.lon, arrival, departure }
     : { label: 'Next stop', name: stop.name, eta: formatEtaMinutes(etaSeconds, nowMs), etaVerb: null, lat: stop.lat, lon: stop.lon, arrival, departure };
+}
+
+// Real GPS fixes land every 20-60s+ in normal operation — beyond this, the feed itself
+// hasn't heard from the vehicle in a while, so its plotted position is a guess rather
+// than a live report, and main.js's popup says so instead of presenting it with false
+// confidence (including suppressing nextStopInfo's claim entirely — see main.js's
+// buildPopupContent). Lives here, not main.js, so the same threshold that gates that
+// claim is what this module's own tests exercise, matching STOP_SANITY_KM's rationale.
+export const STALE_POSITION_MS = 3 * 60 * 1000;
+
+// v.timestamp is GTFS-realtime's vehicle-position epoch seconds (Number | null). nowMs
+// is a parameter (not Date.now() inline) so staleness is deterministic under test, same
+// rationale as describeNextStop's nowMs.
+export function positionStaleness(timestamp, nowMs = Date.now()) {
+  const ageMs = timestamp != null ? nowMs - timestamp * 1000 : null;
+  const stale = ageMs != null && ageMs > STALE_POSITION_MS;
+  return { ageMs, stale };
 }
