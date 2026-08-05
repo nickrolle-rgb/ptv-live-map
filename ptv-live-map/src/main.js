@@ -1192,11 +1192,12 @@ const panelTrack = document.getElementById('panel-track');
 const panelViewport = document.getElementById('panel-viewport');
 const discoveryPaneEl = document.getElementById('discovery-pane');
 const panelTabEls = [...document.querySelectorAll('.panel-tab')];
-const PANE_LABELS = { discovery: 'Nearby', routes: 'Routes' };
-
-const journeyToggleButton = document.getElementById('journey-toggle');
-const journeyPanelEl = document.getElementById('journey-panel');
-const journeyCloseButton = document.getElementById('journey-close');
+const PANE_LABELS = { discovery: 'Nearby', routes: 'Routes', journey: 'Journey' };
+// Order matters here — drives both switchPane's translateX math and wireSwipe's
+// index-based "which pane is next" logic below, so this is the single place that
+// defines pane order; adding a 4th pane only ever needs a new entry here (plus its
+// tab button and .panel-pane in HTML) rather than touching the transform math itself.
+const PANE_ORDER = ['discovery', 'routes', 'journey'];
 const journeyOriginRowEl = document.getElementById('journey-origin-row');
 const journeyTimeModeEl = document.getElementById('journey-time-mode');
 const journeyTimeInputEl = document.getElementById('journey-time-input');
@@ -1214,9 +1215,14 @@ const ridePromptNoButton = document.getElementById('ride-prompt-no');
 let activePane = 'discovery';
 let discoveryRadiusCircle = null;
 
+// % of the track's own width one pane occupies — the track is PANE_ORDER.length * 100%
+// wide (see #panel-track), so translateX(-N * PANE_STEP %) lands exactly N panes over,
+// same convention the old hardcoded 2-pane 0%/-50% used, just generalized.
+const PANE_STEP = 100 / PANE_ORDER.length;
+
 function switchPane(pane) {
   activePane = pane;
-  panelTrack.style.transform = pane === 'discovery' ? 'translateX(0%)' : 'translateX(-50%)';
+  panelTrack.style.transform = `translateX(${-PANE_ORDER.indexOf(pane) * PANE_STEP}%)`;
   panelTabEls.forEach((tab) => tab.classList.toggle('active', tab.dataset.pane === pane));
   panelHeading.textContent = PANE_LABELS[pane];
 
@@ -1228,9 +1234,12 @@ function switchPane(pane) {
         radius: 1000, color: '#2563eb', weight: 1.5, dashArray: '4 6', fillOpacity: 0.03,
       }).addTo(map);
     }
-  } else if (discoveryRadiusCircle) {
-    map.removeLayer(discoveryRadiusCircle);
-    discoveryRadiusCircle = null;
+  } else {
+    if (discoveryRadiusCircle) {
+      map.removeLayer(discoveryRadiusCircle);
+      discoveryRadiusCircle = null;
+    }
+    if (pane === 'journey') renderJourneyPanel();
   }
 }
 
@@ -1253,9 +1262,10 @@ panelTabEls.forEach((tab) => tab.addEventListener('click', () => switchPane(tab.
   panelViewport.addEventListener('touchmove', (e) => {
     if (!dragging || startX == null) return;
     const deltaX = e.touches[0].clientX - startX;
-    const basePercent = activePane === 'discovery' ? 0 : -50;
-    const dragPercent = (deltaX / viewportWidth) * 50;
-    const clamped = Math.max(-50, Math.min(0, basePercent + dragPercent));
+    const activeIdx = PANE_ORDER.indexOf(activePane);
+    const basePercent = -activeIdx * PANE_STEP;
+    const dragPercent = (deltaX / viewportWidth) * PANE_STEP;
+    const clamped = Math.max(-(PANE_ORDER.length - 1) * PANE_STEP, Math.min(0, basePercent + dragPercent));
     panelTrack.style.transform = `translateX(${clamped}%)`;
   }, { passive: true });
 
@@ -1266,9 +1276,11 @@ panelTabEls.forEach((tab) => tab.addEventListener('click', () => switchPane(tab.
     const deltaX = (e.changedTouches[0]?.clientX ?? startX) - startX;
     startX = null;
     const threshold = viewportWidth * 0.2;
-    if (activePane === 'discovery' && deltaX < -threshold) switchPane('routes');
-    else if (activePane === 'routes' && deltaX > threshold) switchPane('discovery');
-    else switchPane(activePane);
+    const activeIdx = PANE_ORDER.indexOf(activePane);
+    let targetIdx = activeIdx;
+    if (deltaX < -threshold && activeIdx < PANE_ORDER.length - 1) targetIdx = activeIdx + 1;
+    else if (deltaX > threshold && activeIdx > 0) targetIdx = activeIdx - 1;
+    switchPane(PANE_ORDER[targetIdx]);
   });
 })();
 
@@ -2191,7 +2203,7 @@ function renderPlannedJourneySection() {
 }
 
 function renderJourneyPanel() {
-  if (!journeyPanelEl.classList.contains('open')) return;
+  if (!panel.classList.contains('open') || activePane !== 'journey') return;
 
   journeyOriginRowEl.innerHTML = userLocation
     ? 'From: <strong>Your location</strong>'
@@ -2282,35 +2294,22 @@ function renderJourneyPanel() {
   renderJourneyWalkSection('Stops near your destination', destWalk);
 }
 
-// Only one of the route-picker panel and the journey panel may be open at a time —
-// opening either one closes the other first. Declared at module scope (not nested
-// inside initRoutePicker/initJourneyPanel) so each can call the other; the mutual call
-// only ever fires on the *opening* branch, never on close, so there's no risk of the two
-// re-triggering each other back and forth.
+// Discovery/Routes/Journey all live in one panel behind one toggle now (previously
+// Journey was a second, separate floating panel with its own toggle, coordinated via a
+// "only one of the two may be open" mutual-close — a real bug on at least one phone,
+// where opening Journey didn't reliably close the other panel first). One panel means
+// one open/close state, so that whole class of bug no longer has anywhere to occur.
 function setPanelOpen(open) {
   panel.classList.toggle('open', open);
   toggleButton.classList.toggle('open', open);
   toggleButton.setAttribute('aria-expanded', String(open));
-  if (open) {
-    setJourneyPanelOpen(false);
-    if (activePane === 'discovery') switchPane('discovery');
-  }
+  // Refresh whichever pane is active on open — matches what each pane already did
+  // individually before the merge (discovery re-centers its radius circle/list, journey
+  // rebuilds its results), just through one shared path instead of two.
+  if (open) switchPane(activePane);
 }
 
-function setJourneyPanelOpen(open) {
-  journeyPanelEl.classList.toggle('open', open);
-  journeyToggleButton.classList.toggle('open', open);
-  journeyToggleButton.setAttribute('aria-expanded', String(open));
-  if (open) {
-    setPanelOpen(false);
-    renderJourneyPanel();
-  }
-}
-
-function initJourneyPanel() {
-  journeyToggleButton.addEventListener('click', () => setJourneyPanelOpen(!journeyPanelEl.classList.contains('open')));
-  journeyCloseButton.addEventListener('click', () => setJourneyPanelOpen(false));
-
+function initJourneyPane() {
   journeyTimeModeEl.addEventListener('change', (e) => {
     journeyTimeMode = e.target.value;
     // Default the time picker to now/soon the moment it becomes relevant, rather than
@@ -2349,10 +2348,11 @@ function initJourneyPanel() {
     journeySearchInput.focus();
   });
 
-  // Only picks a destination while the panel is actually open, so this never
-  // interferes with normal map interaction (vehicle popups, panning) otherwise.
+  // Only picks a destination while the panel is open on the Journey pane specifically,
+  // so this never interferes with normal map interaction (vehicle popups, panning) or
+  // with the Discovery/Routes panes otherwise.
   map.on('click', (e) => {
-    if (!journeyPanelEl.classList.contains('open')) return;
+    if (!panel.classList.contains('open') || activePane !== 'journey') return;
     setJourneyDestination({
       lat: e.latlng.lat,
       lon: e.latlng.lng,
@@ -2607,7 +2607,7 @@ function loadTripHeadsigns() {
 }
 
 initRoutePicker();
-initJourneyPanel();
+initJourneyPane();
 updateToggleLabel();
 centerOnUser();
 scheduleRefresh();

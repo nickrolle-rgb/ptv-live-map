@@ -131,11 +131,12 @@ body.dark-mode {
 .panel-tab.active { background: var(--panel-bg); color: var(--text-primary); box-shadow: 0 1px 2px rgba(0,0,0,0.15); }
 
 #panel-viewport { overflow: hidden; touch-action: pan-y; }
-#panel-track { display: flex; width: 200%; transition: transform 0.25s ease; }
+#panel-track { display: flex; width: 300%; transition: transform 0.25s ease; }
 #panel-track.dragging { transition: none; }
-.panel-pane { width: 50%; flex-shrink: 0; box-sizing: border-box; min-width: 0; }
+.panel-pane { width: 33.3333%; flex-shrink: 0; box-sizing: border-box; min-width: 0; }
 #discovery-pane { padding-right: 4px; }
-#routes-pane { padding-left: 4px; }
+#routes-pane { padding-left: 4px; padding-right: 4px; }
+#journey-pane { padding-left: 4px; }
 
 #discovery-pane { max-height: 340px; overflow-y: auto; scrollbar-width: thin; }
 .discovery-empty { padding: 24px 8px; text-align: center; color: var(--text-muted); font-size: 13px; line-height: 1.5; }
@@ -196,44 +197,6 @@ body.dark-mode {
 .rp-select-all:hover { color: var(--text-primary); }
 
 .journey-dest-icon { background: transparent !important; border: none !important; }
-
-#journey-picker { position: relative; display: block; margin-top: 8px; }
-
-#journey-toggle {
-  display: flex; align-items: center; gap: 8px;
-  padding: 8px 14px; font-size: 14px; font-weight: 500;
-  border-radius: 10px; border: 1px solid var(--panel-border);
-  background: var(--panel-bg); color: var(--text-primary);
-  cursor: pointer; box-shadow: var(--shadow);
-  transition: background 0.15s ease;
-}
-#journey-toggle:hover { background: var(--row-hover); }
-#journey-toggle:active { transform: scale(0.98); }
-#journey-chevron { font-size: 10px; color: var(--text-muted); transition: transform 0.15s ease; display: inline-block; }
-#journey-toggle.open #journey-chevron { transform: rotate(180deg); }
-
-#journey-panel {
-  position: absolute; top: 100%; left: 0; margin-top: 8px;
-  background: var(--panel-bg); color: var(--text-primary);
-  border: 1px solid var(--panel-border); border-radius: 12px;
-  box-shadow: var(--shadow); padding: 14px; width: 280px;
-  opacity: 0; transform: translateY(-6px) scale(0.98);
-  pointer-events: none; transform-origin: top left;
-  transition: opacity 0.15s ease, transform 0.15s ease;
-}
-#journey-panel.open { opacity: 1; transform: translateY(0) scale(1); pointer-events: auto; }
-
-#journey-header {
-  display: flex; align-items: center; justify-content: space-between;
-  margin-bottom: 12px; font-size: 12px; font-weight: 700;
-  letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted);
-}
-#journey-close {
-  background: none; border: none; cursor: pointer;
-  font-size: 18px; line-height: 1; color: var(--text-muted); padding: 2px 6px;
-  border-radius: 6px;
-}
-#journey-close:hover { background: var(--row-hover); color: var(--text-primary); }
 
 #journey-origin-row { font-size: 13px; color: var(--text-primary); margin-bottom: 10px; }
 
@@ -306,10 +269,10 @@ body.dark-mode {
 .journey-option-swatch { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .journey-option-summary { font-size: 11.5px; color: var(--text-muted); margin-top: 5px; }
 
-/* On-board ride detection: a floating confirmation prompt, not anchored to a toggle
-   button like #route-picker-panel/#journey-panel, so it's positioned fixed near the
-   bottom of the viewport instead of the top-anchored dropdown pattern those use — same
-   panel chrome and open/close transition, different placement. */
+/* On-board ride detection: a floating confirmation prompt, not anchored to the
+   #route-picker-toggle button, so it's positioned fixed near the bottom of the
+   viewport instead of the top-anchored dropdown pattern #route-picker-panel uses —
+   same panel chrome and open/close transition, different placement. */
 #ride-prompt {
   position: fixed; left: 50%; bottom: 20px;
   background: var(--panel-bg); color: var(--text-primary);
