@@ -43,6 +43,8 @@ describe('findWalkableStops', () => {
         bike: ['Bike & Ride 1', -37.8140, 144.9635],
         kiss: ['Kiss & Ride', -37.8141, 144.9636],
         taxi: ['Taxi Zone', -37.8142, 144.9637],
+        street1: ['Young St', -37.8143, 144.9638], // near the origin, a real boardable entrance...
+        street2: ['Young St', -38.5000, 145.5000], // ...but this same-named one is at "Far Station", not nearby (real case: Frankston + Ivanhoe both have a "Young St" entrance, ~40km apart)
       },
     },
   ];
@@ -85,6 +87,19 @@ describe('findWalkableStops', () => {
     const result = findWalkableStops(origin.lat, origin.lon, stopTables, { capMinutes: DEFAULT_WALK_CAP_MINUTES });
     const parkAndRide = result.stops.find((s) => s.name === 'Park & Ride');
     expect(parkAndRide).toBeUndefined();
+  });
+
+  it('regression: a generic *boardable* name reused at a far-away station is kept as a separate cluster, not merged (the "Young St" / Frankston+Ivanhoe case)', () => {
+    // Unlike Park & Ride above (an amenity name, filtered out entirely), "Young St" is a
+    // real boardable entrance — it can't be dropped, so it must instead be split into two
+    // independent clusters by proximity rather than one contaminated entry that reports
+    // the near instance's ~0-minute walk while quietly including the far instance's
+    // stop_id as if it were equally reachable.
+    const result = findWalkableStops(origin.lat, origin.lon, stopTables, { capMinutes: DEFAULT_WALK_CAP_MINUTES });
+    const youngSt = result.stops.filter((s) => s.name === 'Young St');
+    expect(youngSt).toHaveLength(1); // the far one didn't make the cap at all
+    expect(youngSt[0].stopIds).toEqual(['street1']);
+    expect(youngSt[0].stopIds).not.toContain('street2');
   });
 
   it('falls back to the single nearest stop, flagged withinCap:false, when nothing is within the cap', () => {

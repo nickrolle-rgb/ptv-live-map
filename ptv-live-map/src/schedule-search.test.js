@@ -324,6 +324,60 @@ describe('planJourney — interchange walk-distance cap', () => {
   });
 });
 
+describe('planJourney — cross-mode interchange by proximity, not name (tram<->train)', () => {
+  // Regression coverage for buildInterchangeGroups' proximity rewrite — mirrors the real
+  // Flinders Street case that motivated it: two stops ~1.5m apart (same tiny offset as
+  // S2/S2B above) that share no stop_id *and* no name at all, on two entirely separate
+  // per-mode schedule datasets, exactly matching train vs tram's real data shape (train:
+  // "Flinders Street Station"; tram: "Flinders Street Railway Station/Elizabeth St #1").
+  const ORIGIN = { id: 'CM_ORIGIN', name: 'Cross Origin', lat: -37.80000, lon: 144.95000 };
+  const TRAIN_HUB = { id: 'CM_TRAIN_HUB', name: 'Flinders Street Station', lat: -37.83000, lon: 144.95000 };
+  const TRAM_HUB = { id: 'CM_TRAM_HUB', name: 'Flinders Street Railway Station/Elizabeth St #1', lat: -37.83001, lon: 144.95001 };
+  const DEST = { id: 'CM_DEST', name: 'Cross Dest', lat: -37.86000, lon: 144.95000 };
+  const crossRegistry = Object.fromEntries(
+    [ORIGIN, TRAIN_HUB, TRAM_HUB, DEST].map((s) => [s.id, [s.name, s.lat, s.lon]])
+  );
+
+  const trainData = {
+    stopIds: ['CM_ORIGIN', 'CM_TRAIN_HUB'],
+    routeIds: ['TRAIN_R'],
+    serviceIds: ['WEEKDAY'],
+    // Origin -> Flinders Street (train), depart 08:00, arrive 08:10.
+    trips: { CM_T1: { r: 0, s: 0, stops: [[0, null, 8 * 3600], [1, 8 * 3600 + 600, null]] } },
+    calendar: { WEEKDAY: WEEKDAY_CAL },
+    calendarDates: {},
+  };
+  const tramData = {
+    stopIds: ['CM_TRAM_HUB', 'CM_DEST'],
+    routeIds: ['TRAM_R'],
+    serviceIds: ['WEEKDAY'],
+    // Flinders Street (tram) -> Dest, depart 08:15, arrive 08:25 — only reachable by
+    // transferring from the train stop above, which shares no name or stop_id with this one.
+    trips: { CM_T2: { r: 0, s: 0, stops: [[0, null, 8 * 3600 + 900], [1, 8 * 3600 + 1500, null]] } },
+    calendar: { WEEKDAY: WEEKDAY_CAL },
+    calendarDates: {},
+  };
+
+  it('finds a train->tram itinerary via a differently-named, physically-close interchange', () => {
+    const result = planJourney({
+      origin: { lat: ORIGIN.lat, lon: ORIGIN.lon },
+      destination: { lat: DEST.lat, lon: DEST.lon },
+      departureEpochMs: QUERY_BEFORE_0800,
+      schedules: [
+        { mode: 'train', data: trainData },
+        { mode: 'tram', data: tramData },
+      ],
+      stopRegistry: crossRegistry,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.legs).toHaveLength(2);
+    expect(result.legs[0].alightStop).toBe('Flinders Street Station');
+    expect(result.legs[1].boardStop).toBe('Flinders Street Railway Station/Elizabeth St #1');
+    expect(result.legs[1].alightStop).toBe('Cross Dest');
+    expect(result.arriveBy).toBe('08:25');
+  });
+});
+
 describe('planJourney — GTFS calendar_dates exceptions', () => {
   it('excludes a normally-active service on a calendar_dates type=2 (removed) date', () => {
     const data = baseScheduleData();

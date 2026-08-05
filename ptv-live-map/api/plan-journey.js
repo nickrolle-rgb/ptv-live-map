@@ -12,8 +12,10 @@
 // Fetch API (Request) => Response shape.
 import trainSchedule from '../src/data/schedule/train-schedule.json' with { type: 'json' };
 import vlineSchedule from '../src/data/schedule/vline-schedule.json' with { type: 'json' };
+import tramSchedule from '../src/data/schedule/tram-schedule.json' with { type: 'json' };
 import trainStopNames from '../src/data/train-stop-names.json' with { type: 'json' };
 import vlineStopNames from '../src/data/vline-stop-names.json' with { type: 'json' };
+import tramStopNames from '../src/data/tram-stop-names.json' with { type: 'json' };
 import { planJourney, planJourneyArrivingBy } from '../src/schedule-search.js';
 
 // Built once at module scope, not per-request, so it's reused across warm invocations
@@ -21,11 +23,16 @@ import { planJourney, planJourneyArrivingBy } from '../src/schedule-search.js';
 // by this object's identity, actually pays off). Safe to merge with a plain spread:
 // train and V/Line share one PTV-wide stop_id space, confirmed against real data (both
 // list identical [name, lat, lon] triples for shared physical stops like Southern
-// Cross) before relying on it here.
-const stopRegistry = { ...trainStopNames, ...vlineStopNames };
+// Cross) before relying on it here. Tram does *not* share that space (confirmed zero
+// overlapping stop_ids, and an entirely different naming convention — see
+// schedule-search.js's buildInterchangeGroups for why that's fine: interchanges are
+// resolved by physical proximity, not by stop_id or name matching, specifically so tram
+// can be spread in here safely without needing a shared id space of its own.
+const stopRegistry = { ...trainStopNames, ...vlineStopNames, ...tramStopNames };
 const schedules = [
   { mode: 'train', data: trainSchedule },
   { mode: 'vline', data: vlineSchedule },
+  { mode: 'tram', data: tramSchedule },
 ];
 
 function parseCoord(value) {

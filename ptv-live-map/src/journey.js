@@ -36,23 +36,29 @@ export function walkingMinutesTo(lat1, lon1, lat2, lon2) {
 // This is not just display clutter to trim: these names are frequently reused verbatim
 // across dozens of unrelated stations statewide (confirmed against the bundled data —
 // "Park & Ride" alone spans ~95 physical locations, "Decision point 1" ~120), and
-// findWalkableStops below groups purely by exact name match with no distance sanity
-// check — a real design tradeoff for genuinely same-named multi-platform stations
-// (e.g. every "Flinders Street Station" platform), but one that silently merges these
-// generic names into a single fake "nearby" stop otherwise, whose stopIds then get
-// treated by callers (this function's own seeding, plus schedule-search.js's CSA
-// search) as reachable within the *nearest* instance's walk time — even though most of
-// the merged stop_ids are actually hundreds of kilometers away. An unfiltered generic
-// name can therefore make the planner believe a distant, unrelated station is a
-// 17-minute walk away, not just add noise to a display list.
-//
-// Known gap, deliberately not addressed here: real (boardable) stops that coincidentally
-// share a common street name across different suburbs — e.g. "Station St" — hit this
-// same merge-by-name flaw but aren't amenity points, so they can't be filtered out by a
-// name pattern. Fixing that properly needs geography-aware grouping (only merge
-// same-named entries that are also physically close), not a blocklist; flagged as a
-// separate, larger follow-up rather than folded into this list.
+// findWalkableStops groups by exact name match, but only merges same-named entries that
+// are also physically close (see SAME_NAME_MERGE_RADIUS_KM below) — a real design
+// tradeoff for genuinely same-named multi-platform stations (e.g. every "Flinders Street
+// Station" platform), balanced against generic names that recur across unrelated,
+// far-apart stations. NON_BOARDING_STOP_PATTERN below still exists to filter out
+// wayfinding/amenity nodes outright (not worth surfacing as a "walkable stop" at all,
+// near or far) — but before the geography-aware merge was added, any *boardable* stop
+// with a coincidentally-reused name (not just amenity ones) would merge across whatever
+// distance separated them. Concretely: both Frankston's and Ivanhoe's station-entrance
+// nodes are named "Young St" (a generic street name, not an amenity pattern) despite
+// being ~40km apart — confirmed in real bundled data, not a hypothetical — so an
+// unguarded merge folded Ivanhoe's entrance stop_id into what should have been a
+// Frankston-only "walkable stop" entry. Dormant while schedule-search.js's interchange
+// matching was itself name-only (that stage separately capped same-named-but-distant
+// pairs by walk time), but once that matching became proximity-based, the phantom entry
+// was live data indistinguishable from a real short walk, and let the planner treat a
+// same-named entrance halfway across Melbourne as instantly reachable.
 const NON_BOARDING_STOP_PATTERN = /decision point|\bdp\s?\d+\b|\blift\b|\bconcourse\b|park\s*&\s*ride|bike\s*&\s*ride|kiss\s*&\s*ride|taxi\s*zone/i;
+
+// Generous enough to span every platform/entrance of one real station (even a large
+// interchange), small enough that two unrelated stations sharing a generic name (the
+// "Young St" case above) land in separate clusters instead of one contaminated entry.
+const SAME_NAME_MERGE_RADIUS_KM = 2;
 
 // stopTables: [{ mode, stopNames }], stopNames shaped stopId -> [name, lat, lon] (the
 // same tables MODES[mode].stopNames already provides in main.js) — passed in rather
@@ -75,27 +81,34 @@ const NON_BOARDING_STOP_PATTERN = /decision point|\bdp\s?\d+\b|\blift\b|\bconcou
 // stop_ids, not names, so matching a walkable "stop" against what a live trip actually
 // reports requires this set.
 export function findWalkableStops(lat, lon, stopTables, { capMinutes = DEFAULT_WALK_CAP_MINUTES } = {}) {
+  // name -> array of clusters (usually one; more than one only when the same name
+  // recurs at physically distant locations, e.g. the "Young St" case above), each
+  // { name, lat, lon, minutes, modes, stopIds }.
   const byName = new Map();
   stopTables.forEach(({ mode, stopNames }) => {
     Object.entries(stopNames).forEach(([stopId, [name, stopLat, stopLon]]) => {
       if (NON_BOARDING_STOP_PATTERN.test(name)) return;
       const minutes = walkingMinutesTo(lat, lon, stopLat, stopLon);
-      const existing = byName.get(name);
-      if (!existing) {
-        byName.set(name, { name, lat: stopLat, lon: stopLon, minutes, modes: new Set([mode]), stopIds: new Set([stopId]) });
+      const clusters = byName.get(name);
+      const cluster = clusters?.find((c) => haversineKm(c.lat, c.lon, stopLat, stopLon) <= SAME_NAME_MERGE_RADIUS_KM);
+      if (!cluster) {
+        const entry = { name, lat: stopLat, lon: stopLon, minutes, modes: new Set([mode]), stopIds: new Set([stopId]) };
+        if (clusters) clusters.push(entry);
+        else byName.set(name, [entry]);
         return;
       }
-      existing.modes.add(mode);
-      existing.stopIds.add(stopId);
-      if (minutes < existing.minutes) {
-        existing.lat = stopLat;
-        existing.lon = stopLon;
-        existing.minutes = minutes;
+      cluster.modes.add(mode);
+      cluster.stopIds.add(stopId);
+      if (minutes < cluster.minutes) {
+        cluster.lat = stopLat;
+        cluster.lon = stopLon;
+        cluster.minutes = minutes;
       }
     });
   });
 
   const all = [...byName.values()]
+    .flat()
     .map((entry) => ({ ...entry, modes: [...entry.modes], stopIds: [...entry.stopIds] }))
     .sort((a, b) => a.minutes - b.minutes);
 

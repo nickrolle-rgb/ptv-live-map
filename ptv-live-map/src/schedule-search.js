@@ -166,31 +166,66 @@ function buildConnections(schedule, mode, serviceDate, queryDate, activeServices
 }
 
 // Groups a stop-name registry (stopId -> [name, lat, lon]) by name, so mid-journey
-// transfers between platforms of the same station (different stop_id, same name — the
-// exact case Phase 1's findWalkableStops already collapses for display) can be modelled
-// as a short walking edge rather than requiring an exact stop_id match to continue.
+// transfers between nearby platforms (different stop_id, possibly different name) can be
+// modelled as a short walking edge rather than requiring an exact stop_id match to continue.
+//
+// Originally this grouped stops by exact name match (train/V-Line's shared PTV-wide
+// stop_id space meant same-station multi-platform transfers already had matching names).
+// That silently breaks for tram: it uses a completely separate stop_id space *and* naming
+// convention (train: "Flinders Street Station"; tram: "Flinders Street Railway
+// Station/Elizabeth St #1") — confirmed zero exact-name overlap against real stop data
+// before relying on proximity instead — so name matching would never find a real
+// interchange between them, even at Flinders Street. Proximity (can a rider actually walk
+// between these platforms, per the same MAX_INTERCHANGE_WALK_MINUTES cap as before) is the
+// criterion that was always actually meant; name matching was only ever an approximation
+// of it. Confirmed against the existing "far-apart same name" test below that this is a
+// strict generalization, not a behavior change, for stops that do share a name.
+//
+// Stops are bucketed into a coarse lat/lon grid first so this stays close to linear as more
+// modes' stops are added, rather than comparing every stop against every other stop. Grid
+// cells (~1.1km, ~0.87km of longitude at Victoria's latitude) are sized comfortably larger
+// than MAX_INTERCHANGE_WALK_MINUTES' ~615m straight-line reach, so checking a stop's own
+// cell plus its 8 neighbours can never miss a pair the walk-time check would otherwise allow.
+const INTERCHANGE_GRID_DEG = 0.01;
+
+function gridCell(lat, lon) {
+  return [Math.floor(lat / INTERCHANGE_GRID_DEG), Math.floor(lon / INTERCHANGE_GRID_DEG)];
+}
+
 function buildInterchangeGroups(stopRegistry) {
-  const byName = new Map();
-  Object.entries(stopRegistry).forEach(([stopId, [name, lat, lon]]) => {
-    if (!byName.has(name)) byName.set(name, []);
-    byName.get(name).push({ stopId, lat, lon });
+  const stops = Object.entries(stopRegistry).map(([stopId, [name, lat, lon]]) => ({ stopId, name, lat, lon }));
+
+  const grid = new Map();
+  stops.forEach((s) => {
+    const [gLat, gLon] = gridCell(s.lat, s.lon);
+    const key = `${gLat}:${gLon}`;
+    if (!grid.has(key)) grid.set(key, []);
+    grid.get(key).push(s);
   });
 
   const groups = new Map(); // stopId -> [{ stopId, transferSec }]
-  byName.forEach((members) => {
-    members.forEach((self) => {
-      const edges = [];
-      members.forEach((other) => {
-        if (other.stopId === self.stopId) {
-          edges.push({ stopId: other.stopId, transferSec: MIN_TRANSFER_SEC });
-          return;
-        }
-        const walkMinutes = walkingMinutesTo(self.lat, self.lon, other.lat, other.lon);
-        if (walkMinutes > MAX_INTERCHANGE_WALK_MINUTES) return;
-        edges.push({ stopId: other.stopId, transferSec: Math.round(walkMinutes * 60) + MIN_TRANSFER_SEC });
-      });
-      groups.set(self.stopId, edges);
-    });
+  stops.forEach((self) => {
+    const [gLat, gLon] = gridCell(self.lat, self.lon);
+    const edges = [];
+    const seen = new Set();
+    for (let dLat = -1; dLat <= 1; dLat++) {
+      for (let dLon = -1; dLon <= 1; dLon++) {
+        const neighbours = grid.get(`${gLat + dLat}:${gLon + dLon}`);
+        if (!neighbours) continue;
+        neighbours.forEach((other) => {
+          if (seen.has(other.stopId)) return;
+          seen.add(other.stopId);
+          if (other.stopId === self.stopId) {
+            edges.push({ stopId: other.stopId, transferSec: MIN_TRANSFER_SEC });
+            return;
+          }
+          const walkMinutes = walkingMinutesTo(self.lat, self.lon, other.lat, other.lon);
+          if (walkMinutes > MAX_INTERCHANGE_WALK_MINUTES) return;
+          edges.push({ stopId: other.stopId, transferSec: Math.round(walkMinutes * 60) + MIN_TRANSFER_SEC });
+        });
+      }
+    }
+    groups.set(self.stopId, edges);
   });
   return groups;
 }
