@@ -435,6 +435,27 @@ function headsignFor(mode, tripId) {
   return tripHeadsignsByMode[mode]?.[tripId] ?? null;
 }
 
+// The name to show for a specific train service, as opposed to the route/line it runs
+// on (routeInfo(mode, routeId).name — still correct for the route picker's static list,
+// which is naming a line, not a particular trip). A city-bound or through-running train
+// labelled by its route name alone is actively misleading: real headsigns already carry
+// exactly what a platform board shows (confirmed against bundled data) — "Flinders
+// Street via City Loop" for a train terminating in the city, or e.g. "Sunbury via Metro
+// Tunnel" for one continuing through onto another line — while an outbound trip's real
+// headsign already just matches its route name (e.g. "Lilydale"), so unconditionally
+// preferring the headsign needs no direction detection of its own and never regresses
+// the outbound case. Train-only: V/Line's routes are already named by destination, and
+// tram has neither the City Loop nor cross-line through-running ambiguity this exists
+// for. Falls back to the route name whenever a live vehicle's tripId doesn't resolve to
+// a known headsign.
+function tripDisplayName(mode, routeId, tripId) {
+  if (mode === 'train') {
+    const headsign = headsignFor(mode, tripId);
+    if (headsign) return headsign;
+  }
+  return routeInfo(mode, routeId).name;
+}
+
 const DISCOVERY_MODES = ['train', 'tram', 'vline'];
 
 // The stop tables findWalkableStops (src/journey.js) needs — passed in rather than
@@ -604,12 +625,14 @@ function findLiveJourneys(origin, destination, { capMinutes = DEFAULT_WALK_CAP_M
 function buildStopDepartures() {
   const index = new Map();
   tripUpdatesByTrip.forEach((update, key) => {
-    const mode = key.slice(0, key.indexOf(':'));
+    const sep = key.indexOf(':');
+    const mode = key.slice(0, sep);
     if (!DISCOVERY_MODES.includes(mode) || !update.stops) return;
+    const tripId = key.slice(sep + 1); // carried through for tripDisplayName (train headsigns)
     update.stops.forEach((s) => {
       if (!s.stopId) return;
       if (!index.has(s.stopId)) index.set(s.stopId, []);
-      index.get(s.stopId).push({ mode, routeId: update.routeId, arrival: s.arrival, departure: s.departure });
+      index.get(s.stopId).push({ mode, routeId: update.routeId, tripId, arrival: s.arrival, departure: s.departure });
     });
   });
   index.forEach((list) => list.sort((a, b) => (a.departure ?? a.arrival ?? Infinity) - (b.departure ?? b.arrival ?? Infinity)));
@@ -661,11 +684,18 @@ function computeNearestStops(limit = 8) {
 
 function buildPopupContent(v, info, bearing, moving) {
   const modeLabel = v.mode === 'bus' ? BUS_LABEL : (MODES[v.mode]?.label ?? v.mode);
-  const parts = [`<strong>${modeLabel} route ${info.name}</strong>`, `Vehicle: ${v.id}`];
+  const headsign = v.mode === 'bus' ? v.headsign : headsignFor(v.mode, v.tripId);
+  // Trains: lead with the real headsign (see tripDisplayName) instead of "route <line
+  // name>" — "Trains route Lilydale" on a city-bound service is exactly the misleading
+  // label a rider would never see on an actual platform board. Not done for other modes
+  // (see tripDisplayName's header for why). Only suppress the separate "To:" line below
+  // when it would just repeat what the title already says.
+  const usingHeadsignAsTitle = v.mode === 'train' && headsign;
+  const titleLine = usingHeadsignAsTitle ? `${modeLabel} to ${headsign}` : `${modeLabel} route ${info.name}`;
+  const parts = [`<strong>${titleLine}</strong>`, `Vehicle: ${v.id}`];
   const status = routeStatus(v.mode, baseRouteId(v.routeId));
   if (status) parts.push(`⚠ ${status}`);
-  const headsign = v.mode === 'bus' ? v.headsign : headsignFor(v.mode, v.tripId);
-  if (headsign) parts.push(`To: ${headsign}`);
+  if (headsign && !usingHeadsignAsTitle) parts.push(`To: ${headsign}`);
   if (moving) parts.push(`Heading: ${bearingToCompass(bearing)}`);
   else parts.push('Status: stationary');
   // nextStopInfo picks the nearest matching stop to the vehicle's live GPS — but if
@@ -1761,7 +1791,10 @@ function updateDiscoveryPane() {
       const info = routeInfo(u.mode, u.routeId);
       chip.style.background = info.color || MODES[u.mode]?.color || '#666';
       const etaSeconds = u.departure ?? u.arrival;
-      chip.textContent = `${info.name} · ${formatEtaMinutes(etaSeconds, Date.now())}`;
+      // This is meant to read like a real departure board (see PRINCIPLES.md's
+      // PTV-app reference example) — tripDisplayName over the bare route name so a
+      // city-bound train shows its actual headsign, not a misleading line name.
+      chip.textContent = `${tripDisplayName(u.mode, u.routeId, u.tripId)} · ${formatEtaMinutes(etaSeconds, Date.now())}`;
       chips.appendChild(chip);
     });
     row.appendChild(chips);
