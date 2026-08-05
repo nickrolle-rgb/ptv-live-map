@@ -84,14 +84,31 @@ came from.
 
 ## Deferred, not excluded
 
-Route/journey planning (getting from A to B) is on the roadmap, not off it — but
-per Principle 2 it's gated behind confidence in Location through Next Stop first.
-Building a trip planner on top of shaky position/stop data would just launder that
-shakiness into a bigger-looking feature; the order matters.
+Route/journey planning (getting from A to B) shipped once Location through Next Stop
+was solid, not before — per Principle 2, building a trip planner on shaky position/stop
+data would have laundered that shakiness into a bigger-looking feature. Two planners
+exist side by side: a live-first one (matches currently-active trips, so it inherits
+Phase 3's live blind spots) and a full static-schedule one (Connection Scan Algorithm
+over bundled GTFS timetables — correct at any query time, no live blind spot, but only
+as current as the last data refresh). Both cover train, V/Line, and tram.
+
+Bus is deferred from the static-schedule planner specifically, and it's a data-scale
+problem, not a priority one: real GTFS extracts (2026-08-05) show combined tram+bus
+stop_times at ~11.1M rows/894MB against train+V/Line's ~738K rows/59MB. Tram alone
+turned out to be a meaningful chunk of that on its own (~90k trips, 76MB/17MB gzipped —
+still bundleable directly). Metro bus is a different order of magnitude (~950 routes,
+~555MB of stop_times) that the planner's current approach — load one mode's whole
+schedule into memory, connection-scan across all of it — can't reasonably do; it needs
+geographic pre-filtering (candidate routes near the walkable stops at each end) before
+touching bus data at all, which is a real design piece, not a rerun of the tram/V-Line
+build. If a narrower slice is ever wanted, Geelong's local network is cleanly
+identifiable within the bus export by route_id pattern (`##-G##-aus-#`) at 67 of the
+740 routes in that file — tractable on its own; Geelong is not, however, its own
+separate/smaller GTFS export the way the naming suggests it might be.
 
 ## Non-goal
 
 Not trying to out-feature the PTV app on breadth (fares, accessibility routing,
 timetable browsing beyond what a live stop needs). The bet is specifically: live
-vehicle visibility + trustworthy data, with journey planning added later once
-that foundation is solid — nothing broader than that.
+vehicle visibility + trustworthy data, with journey planning built on top of that
+solid foundation rather than ahead of it — nothing broader than that.
