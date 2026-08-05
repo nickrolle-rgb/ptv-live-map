@@ -32,7 +32,10 @@ async function forEachRow(path, onRow) {
   }
 }
 
-let idIdx, nameIdx, latIdx, lonIdx;
+// platform_code is train-only in practice (confirmed: present in train's stops.txt,
+// absent from tram's and V/Line's) — headers.indexOf returns -1 for a feed that doesn't
+// have the column, so platform is written as null there rather than a bogus value.
+let idIdx, nameIdx, latIdx, lonIdx, platformIdx;
 const output = {};
 await forEachRow(stopsPath, (fields, headers) => {
   if (idIdx === undefined) {
@@ -40,8 +43,10 @@ await forEachRow(stopsPath, (fields, headers) => {
     nameIdx = headers.indexOf('stop_name');
     latIdx = headers.indexOf('stop_lat');
     lonIdx = headers.indexOf('stop_lon');
+    platformIdx = headers.indexOf('platform_code');
   }
-  output[fields[idIdx]] = [fields[nameIdx], Number(fields[latIdx]), Number(fields[lonIdx])];
+  const platform = platformIdx === -1 ? null : (fields[platformIdx] || null);
+  output[fields[idIdx]] = [fields[nameIdx], Number(fields[latIdx]), Number(fields[lonIdx]), platform];
 });
 
 mkdirSync('./src/data', { recursive: true });

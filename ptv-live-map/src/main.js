@@ -2025,10 +2025,37 @@ function formatMinutesFromNow(minutes) {
   return rounded <= 0 ? 'now' : `in ${rounded} min`;
 }
 
+// Selects exactly the given route on the map — used when a journey leg is clicked, to
+// answer "where are this route's vehicles right now?" without leaving the journey panel.
+// Always selects (never toggles off): the leg's whole point is "show me this route", and
+// replaces rather than adds to any existing picker selection, since a journey leg's
+// route is a fresh, standalone thing to look at, not one more filter to accumulate.
+// Reuses the exact same selectedRoutes/showRouteShape machinery the route picker's own
+// row-toggle uses (see buildRouteRow), so this is just "select one route" through that
+// same path, not a parallel highlight mechanism.
+function selectRouteOnMap(mode, routeId) {
+  const routeKey = `${mode}:${routeId}`;
+  if (selectedRoutes.size === 1 && selectedRoutes.has(routeKey)) return; // already exactly this
+  selectedRoutes.forEach((key) => {
+    const [selMode, selRouteId] = key.split(/:(.+)/);
+    hideRouteShape(selMode, selRouteId);
+  });
+  selectedRoutes.clear();
+  selectedRoutes.add(routeKey);
+  autoShapeKeys.delete(routeKey);
+  showRouteShape(mode, routeId);
+  updateToggleLabel();
+  renderMarkers();
+  renderRoutePicker();
+}
+
 function renderJourneyOptionLeg(mode, routeId, tripId, text) {
   const info = routeInfo(mode, routeId);
   const leg = document.createElement('div');
-  leg.className = 'journey-option-leg';
+  leg.className = 'journey-option-leg journey-option-leg-clickable';
+  leg.setAttribute('role', 'button');
+  leg.setAttribute('aria-label', `Show ${MODES[mode]?.label ?? mode} route ${info.name} on the map`);
+  leg.tabIndex = 0;
   const swatch = document.createElement('span');
   swatch.className = 'journey-option-swatch';
   swatch.style.background = info.color || MODES[mode]?.color || '#666';
@@ -2036,6 +2063,10 @@ function renderJourneyOptionLeg(mode, routeId, tripId, text) {
   label.textContent = text;
   leg.appendChild(swatch);
   leg.appendChild(label);
+  leg.addEventListener('click', () => selectRouteOnMap(mode, routeId));
+  leg.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectRouteOnMap(mode, routeId); }
+  });
   return leg;
 }
 
@@ -2118,9 +2149,13 @@ function renderPlannedJourneyCard(result) {
     }
     const modeLabel = MODES[leg.mode]?.label ?? leg.mode;
     const info = routeInfo(leg.mode, leg.routeId);
+    // Platform is train-only (see build-stop-names.js) — null for tram/V-Line legs, so
+    // this just silently omits the "Plat N" suffix for those rather than showing nothing.
+    const boardPlat = leg.boardPlatform ? ` Plat ${leg.boardPlatform}` : '';
+    const alightPlat = leg.alightPlatform ? ` Plat ${leg.alightPlatform}` : '';
     card.appendChild(renderJourneyOptionLeg(
       leg.mode, leg.routeId, leg.tripId,
-      `${modeLabel} ${info.name} — ${leg.boardStop} ${leg.boardTime} → ${leg.alightStop} ${leg.alightTime}`,
+      `${modeLabel} ${info.name} — ${leg.boardStop}${boardPlat} ${leg.boardTime} → ${leg.alightStop}${alightPlat} ${leg.alightTime}`,
     ));
   });
 

@@ -137,10 +137,15 @@ function resolveActiveServices(scheduleData, dateStr) {
 // `queryDate` (so a service_id valid on the day before the query, whose late trips
 // carry GTFS's >24h overflow times, lands correctly in the query day's early hours —
 // see this module's header for why only D and D-1 need considering).
-function buildConnections(schedule, mode, serviceDate, queryDate, activeServices) {
+// Pushes directly into the caller's shared `out` array rather than building and
+// returning its own, so the caller never needs `out.push(...built)` — spreading a large
+// array as call arguments blows V8's argument-count ceiling (confirmed: tram's ~90k
+// trips produced enough same-day connections to hit "Maximum call stack size exceeded"
+// on exactly that spread, a limit train+V/Line's much smaller connection counts had
+// never come close to).
+function buildConnections(schedule, mode, serviceDate, queryDate, activeServices, out) {
   const dayOffset = epochDay(serviceDate) - epochDay(queryDate);
   const baseSeconds = dayOffset * SECONDS_PER_DAY;
-  const connections = [];
   Object.entries(schedule.trips).forEach(([tripId, trip]) => {
     if (!activeServices.has(trip.s)) return;
     const { stops } = trip;
@@ -149,7 +154,7 @@ function buildConnections(schedule, mode, serviceDate, queryDate, activeServices
       const [fromIdx, , depRaw] = stops[i];
       const [toIdx, arrRaw] = stops[i + 1];
       if (depRaw == null || arrRaw == null) continue;
-      connections.push({
+      out.push({
         tripId,
         routeId,
         mode,
@@ -162,7 +167,6 @@ function buildConnections(schedule, mode, serviceDate, queryDate, activeServices
       });
     }
   });
-  return connections;
 }
 
 // Groups a stop-name registry (stopId -> [name, lat, lon]) by name, so mid-journey
@@ -276,7 +280,7 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
     [queryDate, addDays(queryDate, -1)].forEach((serviceDate) => {
       const active = resolveActiveServices(data, serviceDate);
       if (active.size === 0) return;
-      connections.push(...buildConnections(data, mode, serviceDate, queryDate, active));
+      buildConnections(data, mode, serviceDate, queryDate, active, connections);
     });
   });
   connections.sort((a, b) => a.depTime - b.depTime);
@@ -403,6 +407,9 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
   });
 
   const nameFor = (stopId) => stopRegistry[stopId]?.[0] ?? stopId;
+  // null for tram/V-Line (their stops.txt doesn't carry platform_code at all — see
+  // build-stop-names.js) and for train stops without one (e.g. a single-platform stop).
+  const platformFor = (stopId) => stopRegistry[stopId]?.[3] ?? null;
   const originStopIdx = originWalk.stops.findIndex((s) => s.stopIds.includes(boardStopId));
   const originStop = originStopIdx >= 0 ? originWalk.stops[originStopIdx] : originWalk.stops[0];
   const destStop = destWalk.stops.find((s) => s.stopIds.includes(bestStopId)) ?? destWalk.stops[0];
@@ -416,8 +423,10 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
       routeId: leg.routeId,
       tripId: leg.tripId,
       boardStop: nameFor(leg.boardStopId),
+      boardPlatform: platformFor(leg.boardStopId),
       boardTime: formatTimeOfDay(leg.boardTime),
       alightStop: nameFor(leg.alightStopId),
+      alightPlatform: platformFor(leg.alightStopId),
       alightTime: formatTimeOfDay(leg.alightTime),
       transferMinutes,
       changedPlatform,

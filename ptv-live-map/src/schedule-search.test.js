@@ -152,6 +152,30 @@ describe('planJourney — basic direct + transfer routing', () => {
     expect(result.arriveBy).toBe('08:25');
   });
 
+  it('surfaces platform_code when the stop registry carries one, and null when it does not', () => {
+    // S1 has no 4th (platform) element at all — mirrors tram/V-Line stop-names.json,
+    // which never carries platform_code (see build-stop-names.js). S2/S2B do carry one,
+    // mirroring train stops, including two different platforms at the "same" interchange
+    // (a real same-name-different-platform transfer should report the change).
+    const platformRegistry = {
+      ...stopRegistry,
+      S2: [S2.name, S2.lat, S2.lon, '3'],
+      S2B: [S2B.name, S2B.lat, S2B.lon, '3A'],
+    };
+    const result = planJourney({
+      origin: { lat: S1.lat, lon: S1.lon },
+      destination: { lat: S3.lat, lon: S3.lon },
+      departureEpochMs: QUERY_BEFORE_0800,
+      schedules: [{ mode: 'train', data: baseScheduleData() }],
+      stopRegistry: platformRegistry,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.legs[0].boardPlatform).toBeNull(); // S1 — no platform data at all
+    expect(result.legs[0].alightPlatform).toBe('3'); // S2
+    expect(result.legs[1].boardPlatform).toBe('3A'); // S2B
+    expect(result.legs[1].alightPlatform).toBeNull(); // S3 — no platform data at all
+  });
+
   it('never produces a leg that arrives before it boards, or a transfer that goes backward in time', () => {
     // Property-style check across several query instants on the same network.
     const queryTimes = [
