@@ -1204,6 +1204,7 @@ const journeyTimeInputEl = document.getElementById('journey-time-input');
 const journeySearchInput = document.getElementById('journey-search');
 const journeySearchWrap = document.getElementById('journey-search-wrap');
 const journeySearchClearButton = document.getElementById('journey-search-clear');
+const journeyHintEl = document.getElementById('journey-hint');
 const journeyResultsEl = document.getElementById('journey-results');
 
 const ridePromptEl = document.getElementById('ride-prompt');
@@ -1832,22 +1833,56 @@ function renderRideProgressView() {
   });
 }
 
-// Journey planning Phase 2: destination-only picking (search a stop name, search a
-// free-text address via Nominatim, or tap the map) — origin is always userLocation for
-// now. Nothing here computes an actual journey yet (Phase 3) — this just proves the
-// pipeline by showing walkable stops (src/journey.js, Phase 1) near both ends.
+// Journey planning Phase 2: destination picking (search a stop name, search a free-text
+// address via Nominatim, or tap the map). Origin defaults to userLocation but can also
+// be manually picked the same way — see journeyOriginMode below — sharing this same
+// search box/results list/map-tap machinery rather than duplicating it, since only one
+// of origin or destination is ever being picked at a time (see journeyIsPickingOrigin).
 let journeyDestination = null; // { lat, lon, label } | null
 let journeyDestMarker = null;
 let journeyQuery = '';
 
-// Journey planning: when to travel — 'now' (default), 'depart' (leave at a chosen
-// time), or 'arrive' (arrive by a chosen time; api/plan-journey.js's
-// planJourneyArrivingBy). Only meaningful for the Phase 5 timetable section below —
+// 'current' (default) uses live GPS (userLocation) as the journey's starting point,
+// same as before this existed. 'manual' lets the rider pick a different starting point
+// — e.g. planning a trip from home before they've left, or from a stop they'll walk to
+// — via the same search/tap-the-map flow destination already uses. journeyOrigin only
+// ever holds a value in 'manual' mode; effectiveJourneyOrigin() below is what every
+// journey-planning call site should read, never userLocation directly (userLocation
+// itself still drives everything unrelated to journey planning — the live map, nearby
+// vehicles, the Discovery pane — unchanged).
+let journeyOriginMode = 'current'; // 'current' | 'manual'
+let journeyOrigin = null; // { lat, lon, label } | null — only set in 'manual' mode
+let journeyOriginMarker = null;
+
+function effectiveJourneyOrigin() {
+  return journeyOriginMode === 'manual' ? journeyOrigin : userLocation;
+}
+// True while manual-origin mode is on but nothing's been picked yet — the shared search
+// box/map-tap target origin instead of destination during this window (see
+// renderJourneyPanel and the map click handler in initJourneyPane).
+function journeyIsPickingOrigin() {
+  return journeyOriginMode === 'manual' && !journeyOrigin;
+}
+
+// Journey planning: when to travel — 'depart' (leave at a chosen time), 'arrive'
+// (arrive by a chosen time; api/plan-journey.js's planJourneyArrivingBy), or 'now'.
+// Defaults to 'arrive' at the current time (rider adjusts from there) rather than 'now'
+// — matches the more common real use case ("get me there by X") better than always
+// starting from "right now". Only meaningful for the Phase 5 timetable section below —
 // Phase 3's live-first matching has no notion of a future/past query, it only ever
 // sees what's reporting position right now, so that section is hidden outside 'now'
 // rather than silently showing "live" results for a different time.
-let journeyTimeMode = 'now';
-let journeyTimeValue = ''; // "HH:MM" from the <input type="time">, browser-local
+let journeyTimeMode = 'arrive';
+// "HH:MM" from the <input type="time">, browser-local. Seeded to the current clock time
+// so the default 'arrive' mode has a real, usable value from first render rather than
+// silently behaving like 'now' until the rider happens to touch the time input
+// themselves (journeyWhenSpec falls back to 'now' whenever journeyTimeValue is empty) —
+// mirrors exactly what the time-mode change handler already does when switching away
+// from 'now' interactively.
+let journeyTimeValue = (() => {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+})();
 
 // Interprets journeyTimeValue as a wall-clock time on the browser's own local calendar
 // day, rolling to tomorrow if that time has already passed today — the ordinary meaning
@@ -1971,6 +2006,51 @@ function setJourneyDestination(point) {
     journeyDestMarker = null;
   }
   renderJourneyPanel();
+}
+
+// Origin's picking flow mirrors destination's exactly (search a stop, search an address,
+// tap the map) — see journeyIsPickingOrigin/selectJourneyPoint for how the shared search
+// box and map-tap handler decide which of these two to actually call.
+function selectJourneyOrigin(point) {
+  journeySearchInput.value = '';
+  journeyQuery = '';
+  journeySearchWrap.classList.remove('has-text');
+  journeyGeocodeResults = [];
+  journeyGeocodePending = false;
+  clearTimeout(journeyGeocodeTimer);
+  setJourneyOrigin(point);
+}
+
+// Green start pin vs destination's red end pin — same shape/size, distinct colour so
+// having both on the map at once (manual origin + destination) reads as a route, not two
+// identical markers.
+function buildJourneyOriginIcon() {
+  const html = '<svg width="26" height="34" viewBox="0 0 26 34">'
+    + '<path d="M13 0C5.8 0 0 5.8 0 13c0 9.75 13 21 13 21s13-11.25 13-21C26 5.8 20.2 0 13 0z" fill="#16a34a" stroke="#fff" stroke-width="1.5"/>'
+    + '<circle cx="13" cy="13" r="5" fill="#fff"/></svg>';
+  return L.divIcon({ className: 'journey-origin-icon', html, iconSize: [26, 34], iconAnchor: [13, 34] });
+}
+
+function setJourneyOrigin(point) {
+  journeyOrigin = point;
+  if (point) {
+    if (journeyOriginMarker) journeyOriginMarker.setLatLng([point.lat, point.lon]);
+    else journeyOriginMarker = L.marker([point.lat, point.lon], { icon: buildJourneyOriginIcon() }).addTo(map);
+  } else if (journeyOriginMarker) {
+    map.removeLayer(journeyOriginMarker);
+    journeyOriginMarker = null;
+  }
+  renderJourneyPanel();
+}
+
+// The one search box and one "tap the map" gesture are shared between picking an origin
+// and picking a destination — only one is ever relevant at a time (journeyIsPickingOrigin
+// is true only in the brief window after switching to manual-origin mode and before a
+// point's been picked), so this dispatches to whichever is currently live rather than
+// needing two parallel search UIs.
+function selectJourneyPoint(point) {
+  if (journeyIsPickingOrigin()) selectJourneyOrigin(point);
+  else selectJourneyDestination(point);
 }
 
 function journeyEmptyMsg(text) {
@@ -2205,13 +2285,29 @@ function renderPlannedJourneySection() {
 function renderJourneyPanel() {
   if (!panel.classList.contains('open') || activePane !== 'journey') return;
 
-  journeyOriginRowEl.innerHTML = userLocation
-    ? 'From: <strong>Your location</strong>'
-    : '<span class="journey-muted">From: enable location, or tap the map to set a destination</span>';
+  const originModeRadio = document.querySelector(`input[name="journey-origin-mode"][value="${journeyOriginMode}"]`);
+  if (originModeRadio) originModeRadio.checked = true;
+
+  if (journeyOriginMode === 'manual' && journeyOrigin) {
+    journeyOriginRowEl.innerHTML = `From: <strong>${journeyOrigin.label}</strong><span class="journey-clear-dest">change</span>`;
+    journeyOriginRowEl.querySelector('.journey-clear-dest').addEventListener('click', () => setJourneyOrigin(null));
+  } else if (journeyOriginMode === 'manual') {
+    journeyOriginRowEl.innerHTML = ''; // mid-pick — the shared search box/hint below already prompts for it
+  } else {
+    journeyOriginRowEl.innerHTML = userLocation
+      ? 'From: <strong>Your location</strong>'
+      : '<span class="journey-muted">From: enable location, or choose "Select departure location" above</span>';
+  }
 
   journeyTimeModeEl.value = journeyTimeMode;
   journeyTimeInputEl.value = journeyTimeValue;
   journeyTimeInputEl.classList.toggle('hidden', journeyTimeMode === 'now');
+
+  const pickingOrigin = journeyIsPickingOrigin();
+  journeySearchInput.placeholder = pickingOrigin ? 'Search your starting stop' : 'Search a destination stop';
+  journeyHintEl.textContent = pickingOrigin
+    ? 'or tap the map to set your starting point'
+    : 'or tap the map to drop a destination pin';
 
   journeyResultsEl.innerHTML = '';
 
@@ -2222,7 +2318,7 @@ function renderJourneyPanel() {
     if (stopMatches.length > 0) {
       journeyResultsEl.appendChild(journeySectionLabel('Stops'));
       stopMatches.forEach((stop) => {
-        journeyResultsEl.appendChild(journeyResultRow(stop.name, () => selectJourneyDestination({ lat: stop.lat, lon: stop.lon, label: stop.name })));
+        journeyResultsEl.appendChild(journeyResultRow(stop.name, () => selectJourneyPoint({ lat: stop.lat, lon: stop.lon, label: stop.name })));
       });
     }
 
@@ -2233,7 +2329,7 @@ function renderJourneyPanel() {
       journeyResultsEl.appendChild(journeyEmptyMsg('Searching addresses…'));
     } else if (journeyGeocodeResults.length > 0) {
       journeyGeocodeResults.forEach((place) => {
-        journeyResultsEl.appendChild(journeyResultRow(place.label, () => selectJourneyDestination({ lat: place.lat, lon: place.lon, label: place.label })));
+        journeyResultsEl.appendChild(journeyResultRow(place.label, () => selectJourneyPoint({ lat: place.lat, lon: place.lon, label: place.label })));
       });
       const attribution = document.createElement('div');
       attribution.className = 'journey-attribution';
@@ -2244,6 +2340,11 @@ function renderJourneyPanel() {
     if (stopMatches.length === 0 && !journeyGeocodePending && journeyGeocodeResults.length === 0) {
       journeyResultsEl.appendChild(journeyEmptyMsg(query.length < GEOCODE_MIN_CHARS ? 'Keep typing to search stops and addresses…' : 'No matches.'));
     }
+    return;
+  }
+
+  if (pickingOrigin) {
+    journeyResultsEl.appendChild(journeyEmptyMsg('Search your starting stop above, or tap the map to set it.'));
     return;
   }
 
@@ -2258,13 +2359,14 @@ function renderJourneyPanel() {
   destHeader.querySelector('.journey-clear-dest').addEventListener('click', () => setJourneyDestination(null));
   journeyResultsEl.appendChild(destHeader);
 
-  if (!userLocation) {
+  const origin = effectiveJourneyOrigin();
+  if (!origin) {
     journeyResultsEl.appendChild(journeyEmptyMsg('Enable location to find journeys.'));
     renderJourneyWalkSection('Stops near your destination', findWalkableStops(journeyDestination.lat, journeyDestination.lon, journeyStopTables(), { capMinutes: DEFAULT_WALK_CAP_MINUTES }));
     return;
   }
 
-  const { options, originWalk, destWalk } = findLiveJourneys(userLocation, journeyDestination);
+  const { options, originWalk, destWalk } = findLiveJourneys(origin, journeyDestination);
   const when = journeyWhenSpec();
 
   journeyResultsEl.appendChild(journeySectionLabel('Right now (live)'));
@@ -2287,7 +2389,7 @@ function renderJourneyPanel() {
     journeyResultsEl.appendChild(journeyEmptyMsg('Live positions only cover right now — see the timetable below for your chosen time.'));
   }
 
-  ensurePlannedJourney(userLocation, journeyDestination, when);
+  ensurePlannedJourney(origin, journeyDestination, when);
   renderPlannedJourneySection();
 
   renderJourneyWalkSection('Stops near your start', originWalk);
@@ -2310,6 +2412,17 @@ function setPanelOpen(open) {
 }
 
 function initJourneyPane() {
+  document.querySelectorAll('input[name="journey-origin-mode"]').forEach((radio) => {
+    radio.addEventListener('change', (e) => {
+      journeyOriginMode = e.target.value;
+      // Switching back to "current location" drops any manually-picked point and its
+      // map marker — re-picking "Select departure location" later starts fresh rather
+      // than silently resurrecting a stale pin from earlier in the session.
+      if (journeyOriginMode === 'current') setJourneyOrigin(null);
+      else renderJourneyPanel();
+    });
+  });
+
   journeyTimeModeEl.addEventListener('change', (e) => {
     journeyTimeMode = e.target.value;
     // Default the time picker to now/soon the moment it becomes relevant, rather than
@@ -2348,16 +2461,20 @@ function initJourneyPane() {
     journeySearchInput.focus();
   });
 
-  // Only picks a destination while the panel is open on the Journey pane specifically,
-  // so this never interferes with normal map interaction (vehicle popups, panning) or
-  // with the Discovery/Routes panes otherwise.
+  // Only picks a point while the panel is open on the Journey pane specifically, so this
+  // never interferes with normal map interaction (vehicle popups, panning) or with the
+  // Discovery/Routes panes otherwise. Sets the origin instead of the destination while
+  // journeyIsPickingOrigin() is true (manual-origin mode, nothing picked yet) — same
+  // shared-target logic as the search box above.
   map.on('click', (e) => {
     if (!panel.classList.contains('open') || activePane !== 'journey') return;
-    setJourneyDestination({
+    const point = {
       lat: e.latlng.lat,
       lon: e.latlng.lng,
       label: `Dropped pin (${e.latlng.lat.toFixed(4)}, ${e.latlng.lng.toFixed(4)})`,
-    });
+    };
+    if (journeyIsPickingOrigin()) setJourneyOrigin(point);
+    else setJourneyDestination(point);
   });
 }
 
