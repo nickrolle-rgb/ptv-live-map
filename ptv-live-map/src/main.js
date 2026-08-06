@@ -435,24 +435,40 @@ function headsignFor(mode, tripId) {
   return tripHeadsignsByMode[mode]?.[tripId] ?? null;
 }
 
-// The name to show for a specific train service, as opposed to the route/line it runs
-// on (routeInfo(mode, routeId).name — still correct for the route picker's static list,
-// which is naming a line, not a particular trip). A city-bound or through-running train
-// labelled by its route name alone is actively misleading: real headsigns already carry
-// exactly what a platform board shows (confirmed against bundled data) — "Flinders
-// Street via City Loop" for a train terminating in the city, or e.g. "Sunbury via Metro
-// Tunnel" for one continuing through onto another line — while an outbound trip's real
-// headsign already just matches its route name (e.g. "Lilydale"), so unconditionally
-// preferring the headsign needs no direction detection of its own and never regresses
-// the outbound case. Train-only: V/Line's routes are already named by destination, and
-// tram has neither the City Loop nor cross-line through-running ambiguity this exists
-// for. Falls back to the route name whenever a live vehicle's tripId doesn't resolve to
-// a known headsign.
+// Abbreviates the one train headsign long enough to matter in a bolded title/chip label
+// — "Flinders Street" -> "Flinders St", matching real platform signage. Checked against
+// the full bundled headsign set (train-trip-headsigns.json): nothing else contains the
+// word "Street", so this can't misfire on some other station name in passing.
+function abbreviateHeadsign(headsign) {
+  return headsign.replace(/\bStreet\b/g, 'St');
+}
+
+// The name to show for a specific service, as opposed to the route/line it runs on
+// (routeInfo(mode, routeId).name — still correct for the route picker's static list,
+// which is naming a line, not a particular trip).
+//
+// Train: the route/line name becomes actively misleading once a service is heading into
+// the city or continuing through onto another line — real headsigns already carry
+// exactly what a platform board shows (confirmed against bundled data) — "Flinders St
+// via City Loop" for a train terminating in the city, or e.g. "Sunbury via Metro Tunnel"
+// for one continuing through onto another line — while an outbound trip's real headsign
+// already just matches its route name (e.g. "Lilydale"), so unconditionally preferring
+// the headsign needs no direction detection of its own and never regresses the outbound
+// case. Shown with no line-name prefix at all — a real departure board doesn't say
+// "Lilydale line: Flinders Street", just "Flinders Street".
+//
+// Tram: unlike a train line's name, a tram route number (e.g. "78") means the same
+// thing regardless of direction, so it's kept, with the headsign appended as "to
+// <destination>" — mirrors the destination blind on the front of the actual vehicle.
+//
+// V/Line and bus are untouched: V/Line's routes are already named by destination
+// (nothing to disambiguate), and bus already carries its own headsign field separately
+// (see this function's callers). Falls back to the plain route name whenever a live
+// vehicle's tripId doesn't resolve to a known headsign, for any mode.
 function tripDisplayName(mode, routeId, tripId) {
-  if (mode === 'train') {
-    const headsign = headsignFor(mode, tripId);
-    if (headsign) return headsign;
-  }
+  const headsign = mode === 'train' || mode === 'tram' ? headsignFor(mode, tripId) : null;
+  if (mode === 'train' && headsign) return abbreviateHeadsign(headsign);
+  if (mode === 'tram' && headsign) return `${routeInfo(mode, routeId).name} to ${headsign}`;
   return routeInfo(mode, routeId).name;
 }
 
@@ -685,13 +701,11 @@ function computeNearestStops(limit = 8) {
 function buildPopupContent(v, info, bearing, moving) {
   const modeLabel = v.mode === 'bus' ? BUS_LABEL : (MODES[v.mode]?.label ?? v.mode);
   const headsign = v.mode === 'bus' ? v.headsign : headsignFor(v.mode, v.tripId);
-  // Trains: lead with the real headsign (see tripDisplayName) instead of "route <line
-  // name>" — "Trains route Lilydale" on a city-bound service is exactly the misleading
-  // label a rider would never see on an actual platform board. Not done for other modes
-  // (see tripDisplayName's header for why). Only suppress the separate "To:" line below
-  // when it would just repeat what the title already says.
-  const usingHeadsignAsTitle = v.mode === 'train' && headsign;
-  const titleLine = usingHeadsignAsTitle ? `${modeLabel} to ${headsign}` : `${modeLabel} route ${info.name}`;
+  // Train/tram: lead with tripDisplayName's real-headsign title instead of "route <line
+  // name>" — see that function's header for why. Only suppress the separate "To:" line
+  // below when it would just repeat what the title already says.
+  const usingHeadsignAsTitle = (v.mode === 'train' || v.mode === 'tram') && Boolean(headsign);
+  const titleLine = usingHeadsignAsTitle ? tripDisplayName(v.mode, v.routeId, v.tripId) : `${modeLabel} route ${info.name}`;
   const parts = [`<strong>${titleLine}</strong>`, `Vehicle: ${v.id}`];
   const status = routeStatus(v.mode, baseRouteId(v.routeId));
   if (status) parts.push(`⚠ ${status}`);
