@@ -1903,6 +1903,25 @@ let journeyDestination = null; // { lat, lon, label } | null
 let journeyDestMarker = null;
 let journeyQuery = '';
 
+// A journey the rider has committed to, from either source (see normalizeLiveOption/
+// normalizePlannedResult) — { source: 'live'|'planned', legs: [...], destWalkMinutes,
+// destStopName, totalMinutes, arriveBy } | null. While set, renderJourneyPanel shows a
+// single decluttered step list instead of the normal search/options UI, and does *not*
+// call findLiveJourneys/ensurePlannedJourney again — the whole point is a route that
+// doesn't reshuffle mid-journey just because a refresh tick found a marginally different
+// live match. The one exception is the "possibly missed" check in renderJourneyPanel:
+// if the next step's boarding time has clearly passed, this gets cleared and the rider
+// drops back to a fresh options list rather than being stuck looking at a stale plan.
+let selectedItinerary = null;
+// Grace window past a step's boarding time before treating it as missed — long enough to
+// absorb ordinary feed lag/last-second boarding, short enough that a genuinely missed
+// connection doesn't sit there looking valid for many more minutes.
+const MISSED_CONNECTION_GRACE_MINUTES = 3;
+// Set right before selectedItinerary is cleared for being stale, so the very next
+// renderJourneyPanel (which falls through to the normal options list in that same call)
+// can surface a one-line explanation instead of the plan just silently vanishing.
+let journeyItineraryMissedNotice = false;
+
 // 'current' (default) uses live GPS (userLocation) as the journey's starting point,
 // same as before this existed. 'manual' lets the rider pick a different starting point
 // — e.g. planning a trip from home before they've left, or from a stop they'll walk to
@@ -2008,6 +2027,15 @@ async function runJourneyGeocode(query) {
 let plannedJourneyKey = null;
 let plannedJourneyResult = null;
 let plannedJourneyPending = false;
+// The instant the current plannedJourneyResult was actually computed *for* — Date.now()
+// at query time for 'now' mode, or the requested depart/arrive-by instant otherwise.
+// normalizePlannedResult anchors leg times to this, not to Date.now() at *selection*
+// time, since a leg's clock time being numerically "earlier" than the current wall
+// clock doesn't mean tomorrow — it just means earlier the same day this itinerary was
+// computed for. Using live Date.now() there was a real bug: browsing a result for even
+// a few minutes before selecting it could push "earlier today" into wrongly resolving
+// as tomorrow.
+let plannedJourneyQueryEpochMs = null;
 
 function plannedJourneyKeyFor(origin, destination, when) {
   return `${origin.lat.toFixed(4)},${origin.lon.toFixed(4)}->${destination.lat.toFixed(4)},${destination.lon.toFixed(4)}`
@@ -2036,6 +2064,7 @@ async function ensurePlannedJourney(origin, destination, when) {
   }
   if (plannedJourneyKey !== key) return; // superseded by a newer origin/destination/time
   plannedJourneyResult = result;
+  plannedJourneyQueryEpochMs = when.epochMs ?? Date.now();
   plannedJourneyPending = false;
   renderJourneyPanel();
 }
@@ -2178,6 +2207,113 @@ function formatMinutesFromNow(minutes) {
   return rounded <= 0 ? 'now' : `in ${rounded} min`;
 }
 
+function epochMsToHHMM(epochMs) {
+  const d = new Date(epochMs);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+// Turns a live-matched option (findLiveJourneys' bespoke direct/one-transfer shape) into
+// the same normalized { legs: [...] } shape normalizePlannedResult below produces, so
+// selectedItinerary can hold either source and renderSelectedItineraryView only needs to
+// know one shape. Each leg gets an absolute boardEpochMs (option only carries *relative*
+// "minutes from now" fields) — that's what the missed-connection check in
+// renderJourneyPanel compares against, and what lets the next step's countdown stay
+// accurate without recomputing the whole search.
+//
+// Necessarily less complete than a planned leg: Phase 3's live matching doesn't compute
+// a specific alight time/stop for a direct (no-transfer) trip's destination the way
+// Phase 5's timetable search does, only an aggregate total — so alightTime/alightStop
+// are left null there rather than guessed. renderSelectedItineraryView already handles a
+// missing alightTime gracefully (same pattern as boardPlatform/alightPlatform being null
+// for non-train legs).
+function normalizeLiveOption(option) {
+  const now = Date.now();
+  const firstBoardEpochMs = now + option.minutesUntilBoard * 60000;
+  const legs = [{
+    mode: option.mode, routeId: option.routeId, tripId: option.tripId,
+    boardStop: option.originStopName, boardTime: epochMsToHHMM(firstBoardEpochMs), boardEpochMs: firstBoardEpochMs,
+    boardPlatform: null,
+    alightStop: option.transfer ? option.transfer.stopName : null,
+    alightTime: option.transfer ? epochMsToHHMM(now + option.transfer.arriveMinutes * 60000) : null,
+    alightPlatform: null, transferMinutes: null, changedPlatform: false,
+  }];
+  if (option.transfer) {
+    const transferBoardEpochMs = now + option.transfer.departMinutes * 60000;
+    legs.push({
+      mode: option.transfer.mode, routeId: option.transfer.routeId, tripId: option.transfer.tripId,
+      boardStop: option.transfer.stopName, boardTime: epochMsToHHMM(transferBoardEpochMs), boardEpochMs: transferBoardEpochMs,
+      boardPlatform: null,
+      alightStop: option.destStopName, alightTime: null, alightPlatform: null,
+      transferMinutes: Math.max(0, Math.round(option.transfer.departMinutes - option.transfer.arriveMinutes)),
+      changedPlatform: false,
+    });
+  }
+  return {
+    source: 'live',
+    destWalkMinutes: option.destWalkMinutes,
+    destStopName: option.destStopName,
+    totalMinutes: option.totalMinutes,
+    arriveBy: null,
+    legs,
+  };
+}
+
+function hhmmOnDay(hhmm, dayEpochMs) {
+  const [h, m] = hhmm.split(':').map(Number);
+  const d = new Date(dayEpochMs);
+  d.setHours(h, m, 0, 0);
+  return d.getTime();
+}
+
+// Turns a Phase 5 planned/timetable result (api/plan-journey.js) into the shared
+// selectedItinerary shape — each leg already has an HH:MM boardTime, so this just adds
+// the absolute boardEpochMs the missed-connection check needs.
+//
+// Deliberately anchored to plannedJourneyQueryEpochMs (the instant the itinerary was
+// actually computed for), not Date.now() at selection time — journeyTimeValueToEpochMs's
+// "roll to tomorrow if this clock time has already passed" rule is meant for interpreting
+// fresh user input, and is the wrong tool here: a leg boarding at, say, 21:05 within an
+// itinerary computed to arrive by 22:24 isn't "tomorrow" just because it's now past 22:00
+// by the time the rider gets around to selecting it — it's simply earlier the same day
+// the whole itinerary was already computed for. Legs only roll forward a day when a
+// later leg's clock time would otherwise land *before* the previous leg's already-
+// resolved instant — a real midnight crossing within the itinerary itself.
+function normalizePlannedResult(result) {
+  let dayAnchorMs = plannedJourneyQueryEpochMs ?? Date.now();
+  let prevEpochMs = null;
+  const legs = result.legs.map((leg) => {
+    let boardEpochMs = hhmmOnDay(leg.boardTime, dayAnchorMs);
+    if (prevEpochMs != null && boardEpochMs < prevEpochMs) {
+      dayAnchorMs += 24 * 3600 * 1000;
+      boardEpochMs = hhmmOnDay(leg.boardTime, dayAnchorMs);
+    }
+    prevEpochMs = boardEpochMs;
+    return { ...leg, boardEpochMs };
+  });
+  return {
+    source: 'planned',
+    destWalkMinutes: result.destination.walkMinutes,
+    destStopName: result.destination.stopName,
+    totalMinutes: result.totalMinutes,
+    arriveBy: result.arriveBy,
+    legs,
+  };
+}
+
+function selectItinerary(itinerary) {
+  selectedItinerary = itinerary;
+  renderJourneyPanel();
+}
+
+function buildSelectItineraryButton(itinerary) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'journey-select-btn';
+  btn.textContent = 'Select this journey';
+  btn.addEventListener('click', () => selectItinerary(itinerary));
+  return btn;
+}
+
 // Selects exactly the given route on the map — used when a journey leg is clicked, to
 // answer "where are this route's vehicles right now?" without leaving the journey panel.
 // Always selects (never toggles off): the leg's whole point is "show me this route", and
@@ -2250,6 +2386,7 @@ function renderJourneyOption(option) {
   summary.className = 'journey-option-summary';
   summary.textContent = `${Math.round(option.destWalkMinutes)} min walk to ${option.destStopName} — total ≈ ${Math.round(option.totalMinutes)} min`;
   card.appendChild(summary);
+  card.appendChild(buildSelectItineraryButton(normalizeLiveOption(option)));
 
   return card;
 }
@@ -2317,6 +2454,7 @@ function renderPlannedJourneyCard(result) {
   summary.textContent = `Walk ${result.destination.walkMinutes} min to ${result.destination.stopName} — `
     + `arrive by ${result.arriveBy} (≈ ${result.totalMinutes} min total)`;
   card.appendChild(summary);
+  card.appendChild(buildSelectItineraryButton(normalizePlannedResult(result)));
 
   return card;
 }
@@ -2343,8 +2481,74 @@ function renderPlannedJourneySection() {
   journeyResultsEl.appendChild(renderPlannedJourneyCard(plannedJourneyResult));
 }
 
+// The decluttered step view for a committed itinerary (see selectedItinerary's header
+// comment) — deliberately much sparser than the normal results UI: no origin-mode
+// radios, no time picker, no search box, no "Right now (live)" vs "Full itinerary"
+// split, just the steps themselves plus a way out. Only the next step's board time
+// carries a live countdown (recomputed from its stored boardEpochMs); every later step
+// just shows its clock time, same as a real departure board would past the very next
+// service.
+function renderSelectedItineraryView() {
+  const itin = selectedItinerary;
+  journeyResultsEl.innerHTML = '';
+
+  const header = document.createElement('div');
+  header.className = 'journey-dest-header';
+  header.innerHTML = `To: <strong>${journeyDestination?.label ?? itin.destStopName}</strong><span class="journey-clear-dest">change route</span>`;
+  header.querySelector('.journey-clear-dest').addEventListener('click', () => {
+    selectedItinerary = null;
+    renderJourneyPanel();
+  });
+  journeyResultsEl.appendChild(header);
+
+  itin.legs.forEach((leg, i) => {
+    if (i > 0 && leg.transferMinutes !== null) {
+      const transferLine = document.createElement('div');
+      transferLine.className = 'journey-option-summary';
+      transferLine.textContent = leg.changedPlatform
+        ? `Change platform, ${leg.transferMinutes} min wait`
+        : `${leg.transferMinutes} min wait`;
+      journeyResultsEl.appendChild(transferLine);
+    }
+    const modeLabel = MODES[leg.mode]?.label ?? leg.mode;
+    const info = routeInfo(leg.mode, leg.routeId);
+    const boardPlat = leg.boardPlatform ? ` Plat ${leg.boardPlatform}` : '';
+    const alightPlat = leg.alightPlatform ? ` Plat ${leg.alightPlatform}` : '';
+    const boardTimeText = i === 0 ? `${leg.boardTime} (${formatMinutesFromNow((leg.boardEpochMs - Date.now()) / 60000)})` : leg.boardTime;
+    const alightText = leg.alightTime ? ` → ${leg.alightStop}${alightPlat} ${leg.alightTime}` : (leg.alightStop ? ` → ${leg.alightStop}${alightPlat}` : '');
+    journeyResultsEl.appendChild(renderJourneyOptionLeg(
+      leg.mode, leg.routeId, leg.tripId,
+      `${modeLabel} ${info.name} — ${leg.boardStop}${boardPlat} ${boardTimeText}${alightText}`,
+    ));
+  });
+
+  const summary = document.createElement('div');
+  summary.className = 'journey-option-summary';
+  summary.textContent = itin.arriveBy
+    ? `Walk ${itin.destWalkMinutes} min to ${itin.destStopName} — arrive by ${itin.arriveBy} (≈ ${Math.round(itin.totalMinutes)} min total)`
+    : `${Math.round(itin.destWalkMinutes)} min walk to ${itin.destStopName} — total ≈ ${Math.round(itin.totalMinutes)} min`;
+  journeyResultsEl.appendChild(summary);
+}
+
 function renderJourneyPanel() {
   if (!panel.classList.contains('open') || activePane !== 'journey') return;
+
+  // A committed itinerary pre-empts everything else below — no origin/destination
+  // controls, no re-search, just its own steps (see renderSelectedItineraryView) unless
+  // its next step's boarding time has clearly passed (see MISSED_CONNECTION_GRACE_MINUTES),
+  // in which case it's presumed missed and this falls through to the normal UI below,
+  // which then surfaces journeyItineraryMissedNotice once.
+  if (selectedItinerary) {
+    const nextBoardEpochMs = selectedItinerary.legs[0]?.boardEpochMs;
+    const missed = nextBoardEpochMs != null && Date.now() > nextBoardEpochMs + MISSED_CONNECTION_GRACE_MINUTES * 60000;
+    if (missed) {
+      selectedItinerary = null;
+      journeyItineraryMissedNotice = true;
+    } else {
+      renderSelectedItineraryView();
+      return;
+    }
+  }
 
   const originModeRadio = document.querySelector(`input[name="journey-origin-mode"][value="${journeyOriginMode}"]`);
   if (originModeRadio) originModeRadio.checked = true;
@@ -2419,6 +2623,11 @@ function renderJourneyPanel() {
   destHeader.innerHTML = `To: <strong>${journeyDestination.label}</strong><span class="journey-clear-dest">change</span>`;
   destHeader.querySelector('.journey-clear-dest').addEventListener('click', () => setJourneyDestination(null));
   journeyResultsEl.appendChild(destHeader);
+
+  if (journeyItineraryMissedNotice) {
+    journeyItineraryMissedNotice = false; // one-shot — shown once, then back to normal
+    journeyResultsEl.appendChild(journeyEmptyMsg("That connection's boarding time has passed — showing fresh options."));
+  }
 
   const origin = effectiveJourneyOrigin();
   if (!origin) {
@@ -2526,9 +2735,13 @@ function initJourneyPane() {
   // never interferes with normal map interaction (vehicle popups, panning) or with the
   // Discovery/Routes panes otherwise. Sets the origin instead of the destination while
   // journeyIsPickingOrigin() is true (manual-origin mode, nothing picked yet) — same
-  // shared-target logic as the search box above.
+  // shared-target logic as the search box above. Ignored entirely while an itinerary is
+  // selected: those controls are already hidden then (see renderSelectedItineraryView),
+  // and silently moving the destination pin behind a committed route's back would leave
+  // the step view showing stale steps for a place the pin no longer points at — "change
+  // route" is the one deliberate way out of that view.
   map.on('click', (e) => {
-    if (!panel.classList.contains('open') || activePane !== 'journey') return;
+    if (!panel.classList.contains('open') || activePane !== 'journey' || selectedItinerary) return;
     const point = {
       lat: e.latlng.lat,
       lon: e.latlng.lng,
