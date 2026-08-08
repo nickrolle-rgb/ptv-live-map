@@ -2300,8 +2300,71 @@ function normalizePlannedResult(result) {
   };
 }
 
+// Looks a stop up by its display name against the same flat index the destination
+// search box already uses — the leg data returned from either journey source only
+// carries a name (see normalizeLiveOption/normalizePlannedResult's header comments),
+// never a stop_id, so this is the only path back to real coordinates to draw with.
+// Exact-name lookup, first-seen wins on a collision — an accepted, existing tradeoff
+// (see journeyStopIndex), fine here since this only ever feeds a visual line, not a
+// routing/timing decision the way stop_id resolution elsewhere in the app does.
+function stopCoordsByName(name) {
+  const entry = journeyStopIndex().find((s) => s.name === name);
+  return entry ? [entry.lat, entry.lon] : null;
+}
+
+let journeyOriginWalkLine = null;
+let journeyDestWalkLine = null;
+
+// Straight-line, not turn-by-turn — this app has no street-network data (see journey.js's
+// header on WALK_CIRCUITY), so a real walking route can't be drawn, only the as-the-crow-
+// flies line the existing walk-time *estimate* is already implicitly built on. Dashed and
+// muted specifically so it can never be mistaken for a transit route's solid line
+// (showRouteShape).
+const WALK_LINE_STYLE = { color: '#71717a', weight: 3, opacity: 0.8, dashArray: '2 9', lineCap: 'round' };
+
+function clearJourneyWalkLines() {
+  if (journeyOriginWalkLine) { map.removeLayer(journeyOriginWalkLine); journeyOriginWalkLine = null; }
+  if (journeyDestWalkLine) { map.removeLayer(journeyDestWalkLine); journeyDestWalkLine = null; }
+}
+
+// Draws the selected itinerary's two walking legs (origin -> first boarding stop, last
+// alighting stop -> destination) and returns every point actually drawn, so the caller
+// can fit the map to them — a walk line drawn well outside the current view is as good
+// as not drawn at all. Silently skips a line it can't resolve coordinates for (e.g. a
+// live-matched direct trip's alight stop, which Phase 3 never computes — see
+// normalizeLiveOption) rather than guessing.
+function drawJourneyWalkLines(itinerary) {
+  clearJourneyWalkLines();
+  const points = [];
+  const origin = effectiveJourneyOrigin();
+  const firstLeg = itinerary.legs[0];
+  if (origin && firstLeg) {
+    const boardPoint = stopCoordsByName(firstLeg.boardStop);
+    if (boardPoint) {
+      const originPoint = [origin.lat, origin.lon];
+      journeyOriginWalkLine = L.polyline([originPoint, boardPoint], WALK_LINE_STYLE).addTo(map);
+      points.push(originPoint, boardPoint);
+    }
+  }
+  const lastLeg = itinerary.legs[itinerary.legs.length - 1];
+  if (journeyDestination && lastLeg?.alightStop) {
+    const alightPoint = stopCoordsByName(lastLeg.alightStop);
+    if (alightPoint) {
+      const destPoint = [journeyDestination.lat, journeyDestination.lon];
+      journeyDestWalkLine = L.polyline([alightPoint, destPoint], WALK_LINE_STYLE).addTo(map);
+      points.push(alightPoint, destPoint);
+    }
+  }
+  return points;
+}
+
 function selectItinerary(itinerary) {
   selectedItinerary = itinerary;
+  const points = drawJourneyWalkLines(itinerary);
+  // Only on the initial selection, not on later re-renders of the same itinerary — a
+  // rider who's since panned/zoomed to look at something else shouldn't get yanked back
+  // every refresh tick.
+  if (points.length > 0) map.fitBounds(L.latLngBounds(points), { padding: [40, 40] });
   renderJourneyPanel();
 }
 
@@ -2497,6 +2560,7 @@ function renderSelectedItineraryView() {
   header.innerHTML = `To: <strong>${journeyDestination?.label ?? itin.destStopName}</strong><span class="journey-clear-dest">change route</span>`;
   header.querySelector('.journey-clear-dest').addEventListener('click', () => {
     selectedItinerary = null;
+    clearJourneyWalkLines();
     renderJourneyPanel();
   });
   journeyResultsEl.appendChild(header);
@@ -2543,6 +2607,7 @@ function renderJourneyPanel() {
     const missed = nextBoardEpochMs != null && Date.now() > nextBoardEpochMs + MISSED_CONNECTION_GRACE_MINUTES * 60000;
     if (missed) {
       selectedItinerary = null;
+      clearJourneyWalkLines();
       journeyItineraryMissedNotice = true;
     } else {
       renderSelectedItineraryView();
