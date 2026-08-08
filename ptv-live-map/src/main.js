@@ -1325,7 +1325,21 @@ panelTabEls.forEach((tab) => tab.addEventListener('click', () => switchPane(tab.
     let targetIdx = activeIdx;
     if (deltaX < -threshold && activeIdx < PANE_ORDER.length - 1) targetIdx = activeIdx + 1;
     else if (deltaX > threshold && activeIdx > 0) targetIdx = activeIdx - 1;
-    switchPane(PANE_ORDER[targetIdx]);
+    if (targetIdx !== activeIdx) {
+      switchPane(PANE_ORDER[targetIdx]);
+    } else {
+      // Not an actual swipe (a plain tap, or a drag that didn't clear the threshold) —
+      // just snap the track back to rest without calling switchPane. switchPane's own
+      // re-render (renderJourneyPanel/updateDiscoveryPane rebuild their pane's innerHTML
+      // from scratch) was firing on *every* touchend inside this panel, including one
+      // whose real target was a radio button, search result, or stop row a few pixels
+      // away — replacing that element out from under the browser's still-pending
+      // synthetic click before it could fire, so nothing inside the panel was reliably
+      // tappable on a real touchscreen (mouse clicks never hit this path, which is why
+      // it went unnoticed testing with mouse-based clicks). Confirmed as the cause of a
+      // real "options aren't selectable on phone" report.
+      panelTrack.style.transform = `translateX(${-activeIdx * PANE_STEP}%)`;
+    }
   });
 })();
 
