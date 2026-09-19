@@ -21,11 +21,18 @@ import trainRouteStopNames from './data/train-route-stop-names.json';
 import metroBusRoutes from './data/metro-bus-routes.json';
 import regionalBusRoutes from './data/regional-bus-routes.json';
 
+// MapTiler rather than CARTO's free basemaps: CARTO began serving watermarked "API KEY
+// REQUIRED" tiles to keyless requests. The key is public by nature (it ships to the
+// browser) — protection is the allowed-origins list set in the MapTiler dashboard, not
+// secrecy — but it's still read from the environment so it stays out of git. Set
+// VITE_MAPTILER_KEY in .env.local for dev and in the Vercel project for deploys. /256/
+// selects 256px tiles (MapTiler's default is 512px, which would misalign Leaflet's grid).
+const MAPTILER_KEY = import.meta.env.VITE_MAPTILER_KEY;
 const TILES = {
-  light: 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
-  dark: 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
+  light: `https://api.maptiler.com/maps/dataviz-light/256/{z}/{x}/{y}{r}.png?key=${MAPTILER_KEY}`,
+  dark: `https://api.maptiler.com/maps/dataviz-dark/256/{z}/{x}/{y}{r}.png?key=${MAPTILER_KEY}`,
 };
-const ATTRIBUTION = '&copy; OpenStreetMap contributors &copy; CARTO';
+const ATTRIBUTION = '&copy; <a href="https://www.maptiler.com/copyright/" target="_blank" rel="noopener">MapTiler</a> &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap contributors</a>';
 const LOCAL_RADIUS_KM = 1;
 const REFRESH_INTERVAL_MS = 10000;
 const STATIONARY_THRESHOLD_M = 15;
