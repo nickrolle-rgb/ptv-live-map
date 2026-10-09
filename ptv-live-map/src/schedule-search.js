@@ -458,17 +458,31 @@ function buildItinerary({ best, origin, destination, departureEpochMs, queryDate
   const boardStopId = hops[0].fromStopId;
   const bestStopId = best.stopId;
 
+  // Real epoch ms for a naive wall-clock-digit time on the query's timeline (see the
+  // totalMinutes comment below for why the two can't just be subtracted).
+  const toEpochMs = (abs) => melbourneWallClockToEpochMs(
+    addDays(queryDate, Math.floor(abs / SECONDS_PER_DAY)),
+    ((abs % SECONDS_PER_DAY) + SECONDS_PER_DAY) % SECONDS_PER_DAY,
+  );
+
+  // Each leg also records every stop it passes with its scheduled time ([stopId, abs
+  // seconds]) — the client's live tracking compares the rider's GPS position against
+  // these to measure how late the vehicle is actually running (see journey-tracking.js).
+  // A boarded trip's hop chain includes every connection from boarding onward, so the
+  // intermediate stops are all here.
   const legs = [];
   hops.forEach((hop) => {
     const last = legs[legs.length - 1];
     if (last && last.tripId === hop.tripId) {
       last.alightStopId = hop.toStopId;
       last.alightTime = hop.arrTime;
+      last.stops.push([hop.toStopId, hop.arrTime]);
     } else {
       legs.push({
         mode: hop.mode, routeId: hop.routeId, tripId: hop.tripId,
         boardStopId: hop.fromStopId, boardTime: hop.depTime,
         alightStopId: hop.toStopId, alightTime: hop.arrTime,
+        stops: [[hop.fromStopId, hop.depTime], [hop.toStopId, hop.arrTime]],
       });
     }
   });
@@ -500,6 +514,12 @@ function buildItinerary({ best, origin, destination, departureEpochMs, queryDate
       alightTime: formatTimeOfDay(leg.alightTime),
       transferMinutes: prev ? Math.round((leg.boardTime - prev.alightTime) / 60) : null,
       changedPlatform: prev ? prev.alightStopId !== leg.boardStopId : false,
+      boardEpochMs: toEpochMs(leg.boardTime),
+      alightEpochMs: toEpochMs(leg.alightTime),
+      stops: leg.stops.map(([stopId, abs]) => {
+        const entry = stopRegistry[stopId];
+        return { stopId, name: entry?.[0] ?? stopId, lat: entry?.[1] ?? null, lon: entry?.[2] ?? null, epochMs: toEpochMs(abs) };
+      }),
     };
   });
 

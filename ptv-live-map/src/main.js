@@ -5,6 +5,7 @@ import { haversineKm } from './geo.js';
 import { findWalkableStops, DEFAULT_WALK_CAP_MINUTES } from './journey.js';
 import { pickNextStop, describeNextStop, positionStaleness, formatEtaMinutes, STOP_SANITY_KM } from './stop-matching.js';
 import { scoreCandidates, advanceStreaks, advanceDivergence } from './ride-detection.js';
+import { buildLegPath, assessItinerary, vehicleFeedDelayMs, MIN_TRANSFER_MS } from './journey-tracking.js';
 import trainRouteNames from './data/train-routes.json';
 import tramRouteNames from './data/tram-routes.json';
 import vlineRouteNames from './data/vline-routes.json';
@@ -1922,14 +1923,9 @@ let journeyQuery = '';
 // if the next step's boarding time has clearly passed, this gets cleared and the rider
 // drops back to a fresh options list rather than being stuck looking at a stale plan.
 let selectedItinerary = null;
-// Grace window past a step's boarding time before treating it as missed — long enough to
-// absorb ordinary feed lag/last-second boarding, short enough that a genuinely missed
-// connection doesn't sit there looking valid for many more minutes.
-const MISSED_CONNECTION_GRACE_MINUTES = 3;
-// Set right before selectedItinerary is cleared for being stale, so the very next
-// renderJourneyPanel (which falls through to the normal options list in that same call)
-// can surface a one-line explanation instead of the plan just silently vanishing.
-let journeyItineraryMissedNotice = false;
+// One-line explanation shown once at the top of the normal Journey UI after a selected
+// journey is retired (finished, or no longer completable), so it doesn't silently vanish.
+let journeyItineraryNotice = null;
 
 // 'current' (default) uses live GPS (userLocation) as the journey's starting point,
 // same as before this existed. 'manual' lets the rider pick a different starting point
@@ -2323,6 +2319,12 @@ function normalizePlannedResult(result) {
   let dayAnchorMs = plannedJourneyQueryEpochMs ?? Date.now();
   let prevEpochMs = null;
   const legs = result.legs.map((leg) => {
+    // The planner now returns each leg's real epoch times directly; the HH:MM
+    // reconstruction below is only for a response from before it did.
+    if (Number.isFinite(leg.boardEpochMs)) {
+      prevEpochMs = leg.boardEpochMs;
+      return { ...leg };
+    }
     let boardEpochMs = hhmmOnDay(leg.boardTime, dayAnchorMs);
     if (prevEpochMs != null && boardEpochMs < prevEpochMs) {
       dayAnchorMs += 24 * 3600 * 1000;
@@ -2404,13 +2406,217 @@ function drawJourneyWalkLines(itinerary) {
 
 function selectItinerary(itinerary) {
   selectedItinerary = itinerary;
+  itinerary.selectedAtMs = Date.now();
+  itinerary.paths = trackingPathsFor(itinerary);
+  itineraryReplan = null;
   const points = drawJourneyWalkLines(itinerary);
   // Only on the initial selection, not on later re-renders of the same itinerary — a
   // rider who's since panned/zoomed to look at something else shouldn't get yanked back
   // every refresh tick.
   if (points.length > 0) map.fitBounds(L.latLngBounds(points), { padding: [40, 40] });
+  updateItineraryTracking();
   renderJourneyPanel();
 }
+
+// --- Live tracking of the selected journey ------------------------------------------
+// While a journey is selected, every GPS fix and data refresh re-assesses it (see
+// journey-tracking.js): which leg the rider is on, how late each vehicle is running
+// (from their own GPS while riding, the vehicle feed otherwise), and whether every
+// remaining connection still works. If one doesn't — or GPS shows a vehicle was missed —
+// the app re-plans from where the rider will actually be, shows the fresh options under
+// a warning, and leaves the choice to them: nothing replaces the route without a tap.
+let itineraryTracking = null; // latest assessItinerary result for selectedItinerary
+let itineraryReplan = null; // { key, keptLegs, pending, result } for the current problem
+
+function trackingPathsFor(itinerary) {
+  // Only timetabled itineraries carry each leg's stop list; a live-matched option can't
+  // be tracked this way (normalizeLiveOption has no per-stop schedule to compare with).
+  if (!itinerary.legs.every((leg) => Array.isArray(leg.stops) && leg.stops.length >= 2)) return null;
+  const paths = itinerary.legs.map((leg) => buildLegPath(leg, MODES[leg.mode]?.shapes?.[leg.routeId] ?? []));
+  return paths.every(Boolean) ? paths : null;
+}
+
+function legVehicleDelayMs(leg) {
+  // A confirmed ride's full remaining stop list beats the regular feed's next-4-stops.
+  if (confirmedRide && confirmedRideStops && confirmedRide.tripId === leg.tripId) {
+    const fromRide = vehicleFeedDelayMs(leg, confirmedRideStops);
+    if (fromRide != null) return fromRide;
+  }
+  return vehicleFeedDelayMs(leg, tripUpdatesByTrip.get(`${leg.mode}:${leg.tripId}`));
+}
+
+function delayLabel(ms) {
+  const m = Math.round(ms / 60000);
+  if (m === 0) return 'on time';
+  return m > 0 ? `${m} min late` : `${-m} min early`;
+}
+
+function timeWithDelay(hhmm, delayMs) {
+  const m = Math.round((delayMs ?? 0) / 60000);
+  return m === 0 ? hhmm : `${hhmm} (${m > 0 ? '+' : ''}${m} min)`;
+}
+
+// Singular, for prose ("the Tram 96", "the Train Hurstbridge") — MODES labels are plural.
+const LEG_MODE_NAMES = { tram: 'Tram', train: 'Train', vline: 'V/Line', bus: 'Bus' };
+
+function legName(leg) {
+  return `${LEG_MODE_NAMES[leg.mode] ?? MODES[leg.mode]?.label ?? leg.mode} ${routeInfo(leg.mode, leg.routeId).name}`;
+}
+
+function describeProblem(problem, itinerary) {
+  if (problem.type === 'missed') {
+    const leg = itinerary.legs[problem.legIndex];
+    return `Looks like you missed the ${leg.boardTime} ${legName(leg)} from ${leg.boardStop}.`;
+  }
+  const from = itinerary.legs[problem.fromLeg];
+  const to = itinerary.legs[problem.toLeg];
+  const delay = itineraryTracking?.legs[problem.fromLeg]?.delayMs ?? 0;
+  const lateness = delay >= 60000 ? `${legName(from)} running ${delayLabel(delay)} — ` : '';
+  return `${lateness}you'll likely miss the ${to.boardTime} ${legName(to)} at ${problem.atStop?.name ?? to.boardStop}.`;
+}
+
+// Re-plans from where the rider will actually be. Keyed so a delay that jitters by a
+// minute between GPS fixes doesn't refetch every tick — a new request only when the
+// problem changes or the predicted arrival moves by a few minutes.
+function replanKeyFor(problem) {
+  if (problem.type === 'missed') return `missed:${problem.legIndex}`;
+  return `conn:${problem.toLeg}:${Math.round(problem.predictedArrivalEpochMs / (3 * 60000))}`;
+}
+
+async function startReplan(problem, itinerary) {
+  const key = replanKeyFor(problem);
+  if (itineraryReplan?.key === key) return;
+  let origin;
+  let departureEpochMs;
+  let keptLegs;
+  if (problem.type === 'connection') {
+    // Stay on the current vehicle to the changeover stop, then re-plan from there.
+    keptLegs = itinerary.legs.slice(0, problem.toLeg);
+    origin = { lat: problem.atStop.lat, lon: problem.atStop.lon };
+    departureEpochMs = problem.predictedArrivalEpochMs + MIN_TRANSFER_MS;
+  } else {
+    keptLegs = itinerary.legs.slice(0, problem.legIndex);
+    const fresh = userLocation && Date.now() - userLocation.timestampMs < 60000;
+    const boardStop = itinerary.legs[problem.legIndex].stops[0];
+    origin = fresh ? { lat: userLocation.lat, lon: userLocation.lon } : { lat: boardStop.lat, lon: boardStop.lon };
+    departureEpochMs = Date.now();
+  }
+  const destination = journeyDestination ?? itinerary.legs.at(-1).stops.at(-1);
+  itineraryReplan = { key, keptLegs, pending: true, result: null };
+  let result = { ok: false, reason: 'request_failed' };
+  try {
+    const params = new URLSearchParams({
+      originLat: origin.lat, originLon: origin.lon, destLat: destination.lat, destLon: destination.lon, departure: departureEpochMs,
+    });
+    result = await (await fetch(`/api/plan-journey?${params}`)).json();
+  } catch (err) {
+    console.error(err);
+  }
+  if (itineraryReplan?.key !== key) return; // superseded
+  itineraryReplan.pending = false;
+  itineraryReplan.result = result;
+  renderJourneyPanel();
+}
+
+// A replacement option, with the legs the rider is keeping (already ridden, or the
+// vehicle they're on up to the changeover) in front of it.
+function mergeReplanOption(option) {
+  const fresh = normalizePlannedResult(option);
+  const kept = itineraryReplan?.keptLegs ?? [];
+  if (kept.length === 0) return fresh;
+  // The fresh plan's "walk from origin" is really the walk between the changeover stop and
+  // its first vehicle, so it becomes that leg's transfer line.
+  const [first, ...rest] = fresh.legs;
+  // From when the (late) vehicle is now predicted to get there, not its timetabled arrival.
+  const keptArrivalMs = itineraryTracking?.legs[kept.length - 1]?.predictedAlightEpochMs ?? kept.at(-1).alightEpochMs;
+  const gapMin = Math.max(0, Math.round((first.boardEpochMs - keptArrivalMs) / 60000));
+  const walkMin = Math.round(fresh.originWalkMinutes ?? 0);
+  const joined = {
+    ...first,
+    transferMinutes: Math.max(0, gapMin - walkMin),
+    transferWalkMinutes: walkMin,
+    transferWalkTo: fresh.originStopName,
+  };
+  const endMs = rest.at(-1)?.alightEpochMs ?? first.alightEpochMs;
+  const totalMinutes = Number.isFinite(endMs)
+    ? (selectedItinerary.originWalkMinutes ?? 0) + (endMs - kept[0].boardEpochMs) / 60000 + (fresh.destWalkMinutes ?? 0)
+    : fresh.totalMinutes;
+  return {
+    ...fresh,
+    totalMinutes,
+    legs: kept.concat([joined], rest),
+    originWalkMinutes: selectedItinerary.originWalkMinutes,
+    originStopName: selectedItinerary.originStopName,
+  };
+}
+
+const journeyAlertEl = document.createElement('div');
+journeyAlertEl.id = 'journey-alert';
+journeyAlertEl.setAttribute('role', 'status');
+journeyAlertEl.setAttribute('aria-live', 'polite');
+const journeyAlertText = document.createElement('div');
+const journeyAlertButton = document.createElement('button');
+journeyAlertButton.type = 'button';
+journeyAlertButton.textContent = 'See options';
+journeyAlertButton.addEventListener('click', () => {
+  if (!panel.classList.contains('open')) setPanelOpen(true);
+  switchPane('journey');
+});
+journeyAlertEl.append(journeyAlertText, journeyAlertButton);
+document.body.appendChild(journeyAlertEl);
+
+// The heads-up toast is for when the rider *isn't* looking at the Journey tab — there,
+// the same warning is already at the top of the steps.
+function syncJourneyAlert(message) {
+  const journeyVisible = panel.classList.contains('open') && activePane === 'journey';
+  journeyAlertText.textContent = message ?? '';
+  journeyAlertEl.classList.toggle('open', Boolean(message) && !journeyVisible);
+}
+
+function updateItineraryTracking() {
+  const itinerary = selectedItinerary;
+  if (!itinerary) {
+    itineraryTracking = null;
+    itineraryReplan = null;
+    syncJourneyAlert(null);
+    return;
+  }
+  if (!itinerary.paths) {
+    // Untrackable (live-matched) itinerary: just retire it once it's clearly over.
+    const endMs = (itinerary.selectedAtMs ?? Date.now()) + ((itinerary.totalMinutes ?? 60) + 30) * 60000;
+    if (Date.now() > endMs) endSelectedItinerary('That journey should be over by now.');
+    return;
+  }
+  itineraryTracking = assessItinerary(itinerary, {
+    nowMs: Date.now(), position: userLocation, paths: itinerary.paths,
+    vehicleDelayMs: (i) => legVehicleDelayMs(itinerary.legs[i]),
+  });
+  if (itineraryTracking.finished) {
+    endSelectedItinerary('Journey complete.');
+    return;
+  }
+  const { problem } = itineraryTracking;
+  if (problem) {
+    startReplan(problem, itinerary);
+    syncJourneyAlert(describeProblem(problem, itinerary));
+  } else {
+    itineraryReplan = null;
+    syncJourneyAlert(null);
+  }
+  renderJourneyPanel();
+}
+
+function endSelectedItinerary(notice) {
+  selectedItinerary = null;
+  itineraryTracking = null;
+  itineraryReplan = null;
+  journeyItineraryNotice = notice;
+  clearJourneyWalkLines();
+  syncJourneyAlert(null);
+  syncJourneyMapLayers();
+  renderJourneyPanel();
+}
+
 
 function buildSelectItineraryButton(itinerary) {
   const btn = document.createElement('button');
@@ -2521,7 +2727,7 @@ const OPTION_KIND_LABELS = { fastest: 'Fastest', simplest: 'Simplest', least_wal
 // One timetabled option. kinds lists every label this journey earned (one journey can be
 // both Fastest and Simplest, say) — the server merges identical journeys, so each card
 // is a genuinely different way to make the trip.
-function renderPlannedJourneyCard(result, kinds = []) {
+function renderPlannedJourneyCard(result, kinds = [], toItinerary = normalizePlannedResult) {
   const card = document.createElement('div');
   card.className = 'journey-option';
 
@@ -2569,7 +2775,7 @@ function renderPlannedJourneyCard(result, kinds = []) {
   summary.textContent = `Then walk ${result.destination.walkMinutes} min from ${result.destination.stopName} to your destination — `
     + `arrive by ${result.arriveBy} (≈ ${result.totalMinutes} min total)`;
   card.appendChild(summary);
-  card.appendChild(buildSelectItineraryButton(normalizePlannedResult(result)));
+  card.appendChild(buildSelectItineraryButton(toItinerary(result)));
 
   return card;
 }
@@ -2626,6 +2832,7 @@ function renderSelectedItineraryView() {
   header.querySelector('.journey-clear-dest').addEventListener('click', () => {
     selectedItinerary = null;
     clearJourneyWalkLines();
+    updateItineraryTracking();
     renderJourneyPanel();
   });
   journeyResultsEl.appendChild(header);
@@ -2637,24 +2844,68 @@ function renderSelectedItineraryView() {
     journeyResultsEl.appendChild(walkLine);
   }
 
+  const tracking = itineraryTracking;
+  const ridingIdx = tracking?.ridingLegIndex ?? null;
+  const nowMs = Date.now();
+  if (tracking) {
+    const statusLeg = ridingIdx ?? tracking.legs.findIndex((l) => l.predictedBoardEpochMs > nowMs - 60000);
+    const t = tracking.legs[statusLeg];
+    if (t?.delayMs != null) {
+      const status = document.createElement('div');
+      status.className = 'journey-live-status';
+      const where = ridingIdx !== null ? `On board the ${legName(itin.legs[ridingIdx])} · running` : `Your ${legName(itin.legs[statusLeg])} is running`;
+      status.textContent = `${where} ${delayLabel(t.delayMs)} (${t.source === 'gps' ? 'from your GPS' : 'live vehicle feed'})`;
+      journeyResultsEl.appendChild(status);
+    }
+  }
+
+  if (tracking?.problem) {
+    const box = document.createElement('div');
+    box.className = 'journey-problem';
+    box.textContent = describeProblem(tracking.problem, itin);
+    journeyResultsEl.appendChild(box);
+    if (!itineraryReplan || itineraryReplan.pending) {
+      journeyResultsEl.appendChild(journeyEmptyMsg('Finding new options…'));
+    } else if (itineraryReplan.result?.ok) {
+      journeyResultsEl.appendChild(journeySectionLabel('New options from here'));
+      const options = itineraryReplan.result.options ?? [{ ...itineraryReplan.result, kinds: [] }];
+      options.forEach((option) => journeyResultsEl.appendChild(renderPlannedJourneyCard(option, option.kinds, mergeReplanOption)));
+      journeyResultsEl.appendChild(journeySectionLabel('Your current plan'));
+    } else {
+      journeyResultsEl.appendChild(journeyEmptyMsg('No other way found from here yet. This will update as things change.'));
+    }
+  }
+
+  // The next leg still to board gets a live countdown; every later one just its time.
+  const nextToBoard = itin.legs.findIndex((leg, i) => (ridingIdx === null || i > ridingIdx)
+    && (tracking?.legs[i]?.predictedBoardEpochMs ?? leg.boardEpochMs) > nowMs - 60000);
+
   itin.legs.forEach((leg, i) => {
     if (i > 0 && leg.transferMinutes !== null) {
       const transferLine = document.createElement('div');
       transferLine.className = 'journey-option-summary';
-      transferLine.textContent = leg.changedPlatform
-        ? `Change platform, ${leg.transferMinutes} min wait`
-        : `${leg.transferMinutes} min wait`;
+      transferLine.textContent = leg.transferWalkMinutes > 0
+        ? `Walk ${leg.transferWalkMinutes} min to ${leg.transferWalkTo}, then ${leg.transferMinutes} min wait`
+        : leg.changedPlatform
+          ? `Change platform, ${leg.transferMinutes} min wait`
+          : `${leg.transferMinutes} min wait`;
       journeyResultsEl.appendChild(transferLine);
     }
     const modeLabel = MODES[leg.mode]?.label ?? leg.mode;
     const info = routeInfo(leg.mode, leg.routeId);
     const boardPlat = leg.boardPlatform ? ` Plat ${leg.boardPlatform}` : '';
     const alightPlat = leg.alightPlatform ? ` Plat ${leg.alightPlatform}` : '';
-    const boardTimeText = i === 0 ? `${leg.boardTime} (${formatMinutesFromNow((leg.boardEpochMs - Date.now()) / 60000)})` : leg.boardTime;
-    const alightText = leg.alightTime ? ` → ${leg.alightStop}${alightPlat} ${leg.alightTime}` : (leg.alightStop ? ` → ${leg.alightStop}${alightPlat}` : '');
+    const t = tracking?.legs[i];
+    const boardWithDelay = timeWithDelay(leg.boardTime, t?.delayMs);
+    const boardTimeText = i === nextToBoard
+      ? `${boardWithDelay}, ${formatMinutesFromNow(((t?.predictedBoardEpochMs ?? leg.boardEpochMs) - nowMs) / 60000)}`
+      : boardWithDelay;
+    const alightTime = leg.alightTime ? timeWithDelay(leg.alightTime, t?.delayMs) : null;
+    const alightText = alightTime ? ` → ${leg.alightStop}${alightPlat} ${alightTime}` : (leg.alightStop ? ` → ${leg.alightStop}${alightPlat}` : '');
+    const onBoard = i === ridingIdx ? ' · on board' : '';
     journeyResultsEl.appendChild(renderJourneyOptionLeg(
       leg.mode, leg.routeId, leg.tripId,
-      `${modeLabel} ${info.name} — ${leg.boardStop}${boardPlat} ${boardTimeText}${alightText}`,
+      `${modeLabel} ${info.name} — ${leg.boardStop}${boardPlat} ${boardTimeText}${alightText}${onBoard}`,
     ));
   });
 
@@ -2673,23 +2924,14 @@ function renderJourneyPanel() {
   // journeyResultsEl's contents and left all of these showing above the steps.
   journeyPaneEl.classList.toggle('itinerary-selected', Boolean(selectedItinerary));
 
-  // A committed itinerary pre-empts everything else below — no origin/destination
-  // controls, no re-search, just its own steps (see renderSelectedItineraryView) unless
-  // its next step's boarding time has clearly passed (see MISSED_CONNECTION_GRACE_MINUTES),
-  // in which case it's presumed missed and this falls through to the normal UI below,
-  // which then surfaces journeyItineraryMissedNotice once.
+  // A selected journey pre-empts everything else below — no origin/destination
+  // controls, no re-search, just its steps (see renderSelectedItineraryView). It's
+  // retired by updateItineraryTracking (finished, or replaced by the rider choosing a
+  // re-planned option), never just because its first departure time has passed — that
+  // older rule dropped the journey three minutes after the rider boarded it.
   if (selectedItinerary) {
-    const nextBoardEpochMs = selectedItinerary.legs[0]?.boardEpochMs;
-    const missed = nextBoardEpochMs != null && Date.now() > nextBoardEpochMs + MISSED_CONNECTION_GRACE_MINUTES * 60000;
-    if (missed) {
-      selectedItinerary = null;
-      clearJourneyWalkLines();
-      journeyItineraryMissedNotice = true;
-      journeyPaneEl.classList.remove('itinerary-selected');
-    } else {
-      renderSelectedItineraryView();
-      return;
-    }
+    renderSelectedItineraryView();
+    return;
   }
 
   const originModeRadio = document.querySelector(`input[name="journey-origin-mode"][value="${journeyOriginMode}"]`);
@@ -2766,9 +3008,9 @@ function renderJourneyPanel() {
   destHeader.querySelector('.journey-clear-dest').addEventListener('click', () => setJourneyDestination(null));
   journeyResultsEl.appendChild(destHeader);
 
-  if (journeyItineraryMissedNotice) {
-    journeyItineraryMissedNotice = false; // one-shot — shown once, then back to normal
-    journeyResultsEl.appendChild(journeyEmptyMsg("That connection's boarding time has passed — showing fresh options."));
+  if (journeyItineraryNotice) {
+    journeyResultsEl.appendChild(journeyEmptyMsg(journeyItineraryNotice));
+    journeyItineraryNotice = null; // one-shot — shown once, then back to normal
   }
 
   const origin = effectiveJourneyOrigin();
@@ -3144,6 +3386,9 @@ function centerOnUser() {
         checkInitialLoadDone();
       }
       if (followMode === 'user') map.panTo([userLocation.lat, userLocation.lon]);
+      // Cheap (one leg's handful of stops), so on every fix rather than the 20m throttle
+      // below — a delay estimate is only as fresh as the position it was measured from.
+      updateItineraryTracking();
       if (userLocationMarker) {
         userLocationMarker.setLatLng([userLocation.lat, userLocation.lon]);
       } else {
@@ -3187,6 +3432,7 @@ async function scheduleRefresh() {
     if (confirmedRide) fetchFullTripStops(confirmedRide.mode, confirmedRide.tripId);
     updateDiscoveryPane();
     renderJourneyPanel();
+    updateItineraryTracking();
   } catch (err) {
     console.error(err);
   } finally {

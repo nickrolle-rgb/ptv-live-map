@@ -56,7 +56,7 @@ body.dark-mode {
   --shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
 }
 
-#controls, #controls *, .leaflet-popup-content { font-family: var(--font-family); }
+#controls, #controls *, .leaflet-popup-content, #journey-alert, #journey-alert * { font-family: var(--font-family); }
 
 #controls { position: absolute; top: 12px; left: 50px; z-index: 1000; }
 #route-picker { position: relative; display: inline-block; }
@@ -353,3 +353,28 @@ body.dark-mode {
 .recenter-control .recenter-button.following { color: #2563eb; }
 body.dark-mode .recenter-control .recenter-button { color: #ccc; }
 body.dark-mode .recenter-control .recenter-button.following { color: #60a5fa; }
+
+
+/* Live journey tracking (see journey-tracking.js / updateItineraryTracking). */
+.journey-live-status { font-size: 12px; color: var(--text-muted); padding: 2px 0 6px; }
+.journey-problem {
+  font-size: 12.5px; line-height: 1.4; color: #b45309; font-weight: 600;
+  background: rgba(217, 119, 6, 0.1); border-radius: 8px; padding: 8px 10px; margin: 4px 0 8px;
+}
+body.dark-mode .journey-problem { color: #fbbf24; background: rgba(251, 191, 36, 0.12); }
+#journey-alert {
+  position: fixed; left: 50%; bottom: 20px; z-index: 1100;
+  display: flex; align-items: center; gap: 10px;
+  background: var(--panel-bg); color: var(--text-primary);
+  border: 1px solid #d97706; border-radius: 12px;
+  box-shadow: var(--shadow); padding: 12px 14px; width: 320px; max-width: calc(100vw - 24px);
+  box-sizing: border-box; font-size: 13px; line-height: 1.4;
+  opacity: 0; transform: translateX(-50%) translateY(6px); pointer-events: none;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+#journey-alert.open { opacity: 1; transform: translateX(-50%) translateY(0); pointer-events: auto; }
+#journey-alert div { flex: 1; }
+#journey-alert button {
+  flex-shrink: 0; padding: 7px 10px; font-size: 12.5px; font-weight: 600; font-family: inherit;
+  border-radius: 8px; border: 1px solid #d97706; background: transparent; color: #d97706; cursor: pointer;
+}
