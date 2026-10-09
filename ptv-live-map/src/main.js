@@ -1278,6 +1278,7 @@ function switchPane(pane) {
   panelTrack.style.transform = `translateX(${-PANE_ORDER.indexOf(pane) * PANE_STEP}%)`;
   panelTabEls.forEach((tab) => tab.classList.toggle('active', tab.dataset.pane === pane));
   panelHeading.textContent = PANE_LABELS[pane];
+  syncJourneyMapLayers();
 
   if (pane === 'discovery') {
     updateDiscoveryPane();
@@ -2087,6 +2088,34 @@ function selectJourneyDestination(point) {
   setJourneyDestination(point);
 }
 
+// The journey's start (green) and destination (red) pins, plus its walk lines, only
+// belong on the map while the rider is actually working with a journey: the Journey tab
+// is open, or a journey is selected (an active trip stays visible with the panel
+// closed). Before this they stayed up after the panel closed, as unexplained,
+// unclickable pins a rider reasonably mistook for something live.
+function journeyLayersVisible() {
+  return Boolean(selectedItinerary) || (panel.classList.contains('open') && activePane === 'journey');
+}
+function syncJourneyMapLayers() {
+  const show = journeyLayersVisible();
+  [journeyOriginMarker, journeyDestMarker, journeyOriginWalkLine, journeyDestWalkLine].forEach((layer) => {
+    if (!layer) return;
+    if (show && !map.hasLayer(layer)) layer.addTo(map);
+    if (!show && map.hasLayer(layer)) map.removeLayer(layer);
+  });
+}
+// Built as DOM, not an HTML string — a label can be a free-text address from Nominatim.
+function journeyPinPopup(title, label) {
+  const el = document.createElement('div');
+  const heading = document.createElement('strong');
+  heading.textContent = title;
+  const hint = document.createElement('div');
+  hint.className = 'journey-muted';
+  hint.textContent = 'Change it in the Journey tab';
+  el.append(heading, document.createElement('br'), document.createTextNode(label ?? ''), hint);
+  return el;
+}
+
 function buildJourneyDestIcon() {
   const html = '<svg width="26" height="34" viewBox="0 0 26 34">'
     + '<path d="M13 0C5.8 0 0 5.8 0 13c0 9.75 13 21 13 21s13-11.25 13-21C26 5.8 20.2 0 13 0z" fill="#dc2626" stroke="#fff" stroke-width="1.5"/>'
@@ -2097,12 +2126,13 @@ function buildJourneyDestIcon() {
 function setJourneyDestination(point) {
   journeyDestination = point;
   if (point) {
-    if (journeyDestMarker) journeyDestMarker.setLatLng([point.lat, point.lon]);
-    else journeyDestMarker = L.marker([point.lat, point.lon], { icon: buildJourneyDestIcon() }).addTo(map);
+    if (!journeyDestMarker) journeyDestMarker = L.marker([point.lat, point.lon], { icon: buildJourneyDestIcon() }).addTo(map).bindPopup('');
+    journeyDestMarker.setLatLng([point.lat, point.lon]).setPopupContent(journeyPinPopup('Journey destination', point.label));
   } else if (journeyDestMarker) {
     map.removeLayer(journeyDestMarker);
     journeyDestMarker = null;
   }
+  syncJourneyMapLayers();
   renderJourneyPanel();
 }
 
@@ -2132,12 +2162,13 @@ function buildJourneyOriginIcon() {
 function setJourneyOrigin(point) {
   journeyOrigin = point;
   if (point) {
-    if (journeyOriginMarker) journeyOriginMarker.setLatLng([point.lat, point.lon]);
-    else journeyOriginMarker = L.marker([point.lat, point.lon], { icon: buildJourneyOriginIcon() }).addTo(map);
+    if (!journeyOriginMarker) journeyOriginMarker = L.marker([point.lat, point.lon], { icon: buildJourneyOriginIcon() }).addTo(map).bindPopup('');
+    journeyOriginMarker.setLatLng([point.lat, point.lon]).setPopupContent(journeyPinPopup('Journey start', point.label));
   } else if (journeyOriginMarker) {
     map.removeLayer(journeyOriginMarker);
     journeyOriginMarker = null;
   }
+  syncJourneyMapLayers();
   renderJourneyPanel();
 }
 
@@ -2367,6 +2398,7 @@ function drawJourneyWalkLines(itinerary) {
       points.push(alightPoint, destPoint);
     }
   }
+  syncJourneyMapLayers();
   return points;
 }
 
@@ -2789,6 +2821,7 @@ function setPanelOpen(open) {
   // individually before the merge (discovery re-centers its radius circle/list, journey
   // rebuilds its results), just through one shared path instead of two.
   if (open) switchPane(activePane);
+  syncJourneyMapLayers();
 }
 
 function initJourneyPane() {
