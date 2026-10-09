@@ -273,6 +273,9 @@ const LEAST_WALKING_DEST_WEIGHT = 3;
 // Upper bound on vehicles in one itinerary. Each round is a full pass over the day's
 // connections; six vehicles is already well past any sensible Melbourne trip.
 const MAX_LEGS = 6;
+// The longest journey worth planning. Melbourne's longest V/Line runs (Albury,
+// Bairnsdale, Warrnambool) are around four hours end to end; six leaves room for waits.
+const MAX_JOURNEY_SPAN_SEC = 6 * 3600;
 
 // Building + sorting a day's connections is most of a query's cost (~250ms on real data)
 // and depends only on the query date, not the departure time — so it's cached per date.
@@ -341,8 +344,16 @@ function seedArrivals(originWalk, queryAbs) {
 //   interchange groups (nearby platforms/stops) and links via the stop actually arrived
 //   at, not c.fromStopId — linking via c.fromStopId was a real bug once: the chain
 //   truncated at the first platform change, dropping every earlier leg.
-function scanRounds(connections, startIdx, seeds, interchangeGroups) {
+// destCost (stopId -> weighted walk seconds from that stop to the destination) and
+// penaltySec describe the most demanding ranking this scan will feed, so the scan can
+// prune: once some journey reaches the destination with score S = arrival + destCost +
+// penaltySec x (vehicles - 1), any connection departing after S can't be part of a
+// better answer under that ranking or any gentler one (every score is at least the
+// arrival time, and arrival is at least the departure). Each round stops there instead
+// of running to endIdx — the bulk of the speedup that brought arrive-by down from ~10s.
+function scanRounds(connections, startIdx, endIdx, seeds, interchangeGroups, destCost, penaltySec) {
   const rounds = [];
+  let bound = Infinity;
   let prevArrival = seeds;
   let prevPredecessor = new Map();
 
@@ -360,8 +371,9 @@ function scanRounds(connections, startIdx, seeds, interchangeGroups) {
     const predecessor = new Map(prevPredecessor);
     const tripHop = new Map(); // tripId -> its latest hop this round
     let improved = false;
-    for (let i = startIdx; i < connections.length; i++) {
+    for (let i = startIdx; i < endIdx; i++) {
       const c = connections[i];
+      if (c.depTime > bound) break;
       let prev = tripHop.get(c.tripId);
       let rootStopId;
       if (prev === undefined) {
@@ -386,6 +398,8 @@ function scanRounds(connections, startIdx, seeds, interchangeGroups) {
         arrival.set(c.toStopId, c.arrTime);
         predecessor.set(c.toStopId, hop);
         improved = true;
+        const cost = destCost.get(c.toStopId);
+        if (cost !== undefined) bound = Math.min(bound, c.arrTime + cost + penaltySec * (hop.legs - 1));
       }
     }
     rounds.push({ arrival, predecessor });
@@ -394,6 +408,20 @@ function scanRounds(connections, startIdx, seeds, interchangeGroups) {
     prevPredecessor = predecessor;
   }
   return rounds;
+}
+
+// stopId -> weight x walk seconds from that stop to the destination, for every stop the
+// destination-side walk covers (see scanRounds' pruning and pickBest's scoring).
+function destinationCosts(destWalk, destination, stopRegistry, weight) {
+  const costs = new Map();
+  destWalk.stops.forEach((stop) => {
+    stop.stopIds.forEach((stopId) => {
+      const entry = stopRegistry[stopId];
+      const walkSec = entry ? walkingMinutesTo(entry[1], entry[2], destination.lat, destination.lon) * 60 : stop.minutes * 60;
+      costs.set(stopId, weight * walkSec);
+    });
+  });
+  return costs;
 }
 
 // Picks the best destination-side hop across every round. Score = arrival at the stop
@@ -514,7 +542,10 @@ function itinerarySignature(itinerary) {
 // journey that's both fastest and simplest shows once, labelled both). Fastest and
 // Simplest share one scan; Least walking needs its own because its tighter walk cap
 // changes which stops get seeded at all.
-export function planJourneyOptions({ origin, destination, departureEpochMs, schedules, stopRegistry, capMinutes = DEFAULT_WALK_CAP_MINUTES }) {
+export function planJourneyOptions({
+  origin, destination, departureEpochMs, schedules, stopRegistry, capMinutes = DEFAULT_WALK_CAP_MINUTES, latestDepartureAbs,
+  kinds = OPTION_KINDS,
+}) {
   const { dateStr: queryDate, seconds: queryAbs } = melbourneDateAndSeconds(departureEpochMs);
 
   // stopRegistry is already merged across modes, so findWalkableStops only needs one table.
@@ -528,14 +559,25 @@ export function planJourneyOptions({ origin, destination, departureEpochMs, sche
   const interchangeGroups = getInterchangeGroups(stopRegistry);
   const connections = getConnections(schedules, queryDate);
   const startIdx = firstIndexAtOrAfter(connections, queryAbs);
+  // Nothing departing after this can be part of a useful answer, so the scan stops there
+  // instead of running to the end of the day — the difference between ~10s and well
+  // under that for an arrive-by search on the live function. Arrive-by passes its own
+  // target (a connection leaving after it can't get you there in time); otherwise
+  // MAX_JOURNEY_SPAN_SEC past the departure.
+  const endIdx = firstIndexAtOrAfter(connections, (latestDepartureAbs ?? queryAbs + MAX_JOURNEY_SPAN_SEC) + 1);
   const ctx = { origin, destination, departureEpochMs, queryDate, queryAbs, stopRegistry };
 
   const picks = [];
-  const rounds = scanRounds(connections, startIdx, seedArrivals(originWalk, queryAbs), interchangeGroups);
-  const fastest = pickBest(rounds, destWalk, destination, stopRegistry);
-  if (fastest) picks.push(['fastest', fastest, originWalk, destWalk]);
-  const simplest = pickBest(rounds, destWalk, destination, stopRegistry, { transferPenaltySec: SIMPLEST_TRANSFER_PENALTY_SEC });
-  if (simplest) picks.push(['simplest', simplest, originWalk, destWalk]);
+  if (kinds.includes('fastest') || kinds.includes('simplest')) {
+    // One scan serves both; it prunes against Simplest's (stricter) score, which is never
+    // below Fastest's, so nothing Fastest needs gets cut.
+    const rounds = scanRounds(connections, startIdx, endIdx, seedArrivals(originWalk, queryAbs), interchangeGroups,
+      destinationCosts(destWalk, destination, stopRegistry, 1), kinds.includes('simplest') ? SIMPLEST_TRANSFER_PENALTY_SEC : 0);
+    const fastest = kinds.includes('fastest') && pickBest(rounds, destWalk, destination, stopRegistry);
+    if (fastest) picks.push(['fastest', fastest, originWalk, destWalk]);
+    const simplest = kinds.includes('simplest') && pickBest(rounds, destWalk, destination, stopRegistry, { transferPenaltySec: SIMPLEST_TRANSFER_PENALTY_SEC });
+    if (simplest) picks.push(['simplest', simplest, originWalk, destWalk]);
+  }
 
   const lwCap = Math.min(capMinutes, LEAST_WALKING_CAP_MINUTES);
   const lwOriginWalk = findWalkableStops(origin.lat, origin.lon, stopTable, { capMinutes: lwCap });
@@ -543,8 +585,9 @@ export function planJourneyOptions({ origin, destination, departureEpochMs, sche
   // Only meaningful when both ends genuinely have a stop inside the tighter cap —
   // findWalkableStops falls back to the single nearest stop otherwise, which would just
   // reproduce a long walk under a "Least walking" label.
-  if (lwOriginWalk.withinCap && lwDestWalk.withinCap && lwOriginWalk.stops.length && lwDestWalk.stops.length) {
-    const lwRounds = scanRounds(connections, startIdx, seedArrivals(lwOriginWalk, queryAbs), interchangeGroups);
+  if (kinds.includes('least_walking') && lwOriginWalk.withinCap && lwDestWalk.withinCap && lwOriginWalk.stops.length && lwDestWalk.stops.length) {
+    const lwRounds = scanRounds(connections, startIdx, endIdx, seedArrivals(lwOriginWalk, queryAbs), interchangeGroups,
+      destinationCosts(lwDestWalk, destination, stopRegistry, LEAST_WALKING_DEST_WEIGHT), 0);
     const leastWalking = pickBest(lwRounds, lwDestWalk, destination, stopRegistry, { destWeight: LEAST_WALKING_DEST_WEIGHT });
     if (leastWalking) picks.push(['least_walking', leastWalking, lwOriginWalk, lwDestWalk]);
   }
@@ -594,14 +637,22 @@ const ARRIVE_BY_STEP_MS = 60 * 1000; // minute-granularity search, matching this
 export function planJourneyOptionsArrivingBy({
   origin, destination, arriveByEpochMs, schedules, stopRegistry, capMinutes = DEFAULT_WALK_CAP_MINUTES,
 }) {
+  // Memoized per minute *and* per scan: Fastest and Simplest share a scan, Least walking
+  // needs its own, so a probe for one never pays for the other.
   const probes = new Map();
-  const probe = (minute) => {
-    if (!probes.has(minute)) {
-      probes.set(minute, planJourneyOptions({
+  const scanKinds = (kind) => (kind === 'least_walking' ? ['least_walking'] : ['fastest', 'simplest']);
+  const probe = (minute, kind = 'fastest') => {
+    const key = `${minute}:${scanKinds(kind)[0]}`;
+    if (!probes.has(key)) {
+      probes.set(key, planJourneyOptions({
+        kinds: scanKinds(kind),
         origin, destination, departureEpochMs: minute * ARRIVE_BY_STEP_MS, schedules, stopRegistry, capMinutes,
+        // Same-day window (below), so the probe's query date is the target's date and the
+        // target's seconds-of-day is directly comparable to its connections' times.
+        latestDepartureAbs: targetSeconds,
       }));
     }
-    return probes.get(minute);
+    return probes.get(key);
   };
   // Uses the planner's own real-epoch arrivalEpochMs directly rather than re-deriving
   // departure + totalMinutes — see buildItinerary's totalMinutes comment for why.
@@ -618,7 +669,9 @@ export function planJourneyOptionsArrivingBy({
   // the query framed as arriving "tomorrow", not a lookback past midnight.
   const { seconds: targetSeconds } = melbourneDateAndSeconds(arriveByEpochMs);
   const hiMin = Math.floor(arriveByEpochMs / ARRIVE_BY_STEP_MS);
-  const loMin = hiMin - Math.floor(targetSeconds / 60);
+  // ...and no earlier than MAX_JOURNEY_SPAN_SEC before the target: a departure further
+  // back than the longest journey worth planning can't be the latest one that works.
+  const loMin = hiMin - Math.floor(Math.min(targetSeconds, MAX_JOURNEY_SPAN_SEC) / 60);
 
   // A failure that isn't time-dependent (no walkable stop at all near either end) fails
   // identically at every departure time — surface that specific reason immediately.
@@ -632,7 +685,7 @@ export function planJourneyOptionsArrivingBy({
     let found = null;
     while (lo <= hi) {
       const mid = lo + Math.floor((hi - lo) / 2);
-      const option = optionFor(probe(mid), kind);
+      const option = optionFor(probe(mid, kind), kind);
       if (option && option.arrivalEpochMs <= arriveByEpochMs) {
         found = option;
         lo = mid + 1; // this departure works — try a later (closer to the target) one
