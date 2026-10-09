@@ -102,6 +102,19 @@ describe('findWalkableStops', () => {
     expect(youngSt[0].stopIds).not.toContain('street2');
   });
 
+  it('regression: same-named stops ~1.3km apart stay separate (the "Collins St" Southern Cross / Town Hall case)', () => {
+    // Both entrances are named "Collins St". A 2km merge radius used to fold them into
+    // one walkable stop; real same-station parts are all within ~0.17km of each other.
+    const tables = [{ mode: 'train', stopNames: {
+      sss: ['Collins St', -37.8194, 144.9526], // Southern Cross entrance
+      thl: ['Collins St', -37.8157, 144.9670], // Town Hall entrance, ~1.3km east
+    } }];
+    const result = findWalkableStops(-37.8194, 144.9526, tables, { capMinutes: DEFAULT_WALK_CAP_MINUTES });
+    const collins = result.stops.filter((s) => s.name === 'Collins St');
+    expect(collins.every((s) => s.stopIds.length === 1)).toBe(true);
+    expect(collins[0].stopIds).toEqual(['sss']);
+  });
+
   it('falls back to the single nearest stop, flagged withinCap:false, when nothing is within the cap', () => {
     const farOnlyTables = [{ mode: 'train', stopNames: { far: ['Far Station', -38.5000, 145.5000] } }];
     const result = findWalkableStops(origin.lat, origin.lon, farOnlyTables, { capMinutes: DEFAULT_WALK_CAP_MINUTES });

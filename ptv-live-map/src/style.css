@@ -208,6 +208,11 @@ body.dark-mode {
 
 #journey-origin-row { font-size: 13px; color: var(--text-primary); margin-bottom: 10px; }
 #journey-origin-row:empty { margin-bottom: 0; }
+#journey-pane.itinerary-selected #journey-origin-mode-row,
+#journey-pane.itinerary-selected #journey-origin-row,
+#journey-pane.itinerary-selected #journey-time-row,
+#journey-pane.itinerary-selected #journey-search-wrap,
+#journey-pane.itinerary-selected #journey-hint { display: none; }
 
 #journey-time-row { display: flex; gap: 6px; margin-bottom: 10px; }
 #journey-time-mode, #journey-time-input {

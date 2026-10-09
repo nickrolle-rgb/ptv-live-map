@@ -1256,6 +1256,7 @@ const journeySearchInput = document.getElementById('journey-search');
 const journeySearchWrap = document.getElementById('journey-search-wrap');
 const journeySearchClearButton = document.getElementById('journey-search-clear');
 const journeyHintEl = document.getElementById('journey-hint');
+const journeyPaneEl = document.getElementById('journey-pane');
 const journeyResultsEl = document.getElementById('journey-results');
 
 const ridePromptEl = document.getElementById('ride-prompt');
@@ -2257,6 +2258,8 @@ function normalizeLiveOption(option) {
   }
   return {
     source: 'live',
+    originWalkMinutes: option.originWalkMinutes,
+    originStopName: option.originStopName,
     destWalkMinutes: option.destWalkMinutes,
     destStopName: option.destStopName,
     totalMinutes: option.totalMinutes,
@@ -2299,6 +2302,8 @@ function normalizePlannedResult(result) {
   });
   return {
     source: 'planned',
+    originWalkMinutes: result.origin.walkMinutes,
+    originStopName: result.origin.stopName,
     destWalkMinutes: result.destination.walkMinutes,
     destStopName: result.destination.stopName,
     totalMinutes: result.totalMinutes,
@@ -2454,7 +2459,7 @@ function renderJourneyOption(option) {
 
   const summary = document.createElement('div');
   summary.className = 'journey-option-summary';
-  summary.textContent = `${Math.round(option.destWalkMinutes)} min walk to ${option.destStopName} — total ≈ ${Math.round(option.totalMinutes)} min`;
+  summary.textContent = `Then walk ${Math.round(option.destWalkMinutes)} min from ${option.destStopName} to your destination — total ≈ ${Math.round(option.totalMinutes)} min`;
   card.appendChild(summary);
   card.appendChild(buildSelectItineraryButton(normalizeLiveOption(option)));
 
@@ -2521,7 +2526,7 @@ function renderPlannedJourneyCard(result) {
 
   const summary = document.createElement('div');
   summary.className = 'journey-option-summary';
-  summary.textContent = `Walk ${result.destination.walkMinutes} min to ${result.destination.stopName} — `
+  summary.textContent = `Then walk ${result.destination.walkMinutes} min from ${result.destination.stopName} to your destination — `
     + `arrive by ${result.arriveBy} (≈ ${result.totalMinutes} min total)`;
   card.appendChild(summary);
   card.appendChild(buildSelectItineraryButton(normalizePlannedResult(result)));
@@ -2572,6 +2577,13 @@ function renderSelectedItineraryView() {
   });
   journeyResultsEl.appendChild(header);
 
+  if (itin.originStopName) {
+    const walkLine = document.createElement('div');
+    walkLine.className = 'journey-option-summary';
+    walkLine.textContent = `Walk ${Math.round(itin.originWalkMinutes ?? 0)} min to ${itin.originStopName}`;
+    journeyResultsEl.appendChild(walkLine);
+  }
+
   itin.legs.forEach((leg, i) => {
     if (i > 0 && leg.transferMinutes !== null) {
       const transferLine = document.createElement('div');
@@ -2596,13 +2608,17 @@ function renderSelectedItineraryView() {
   const summary = document.createElement('div');
   summary.className = 'journey-option-summary';
   summary.textContent = itin.arriveBy
-    ? `Walk ${itin.destWalkMinutes} min to ${itin.destStopName} — arrive by ${itin.arriveBy} (≈ ${Math.round(itin.totalMinutes)} min total)`
-    : `${Math.round(itin.destWalkMinutes)} min walk to ${itin.destStopName} — total ≈ ${Math.round(itin.totalMinutes)} min`;
+    ? `Then walk ${itin.destWalkMinutes} min from ${itin.destStopName} to your destination — arrive by ${itin.arriveBy} (≈ ${Math.round(itin.totalMinutes)} min total)`
+    : `Then walk ${Math.round(itin.destWalkMinutes)} min from ${itin.destStopName} to your destination — total ≈ ${Math.round(itin.totalMinutes)} min`;
   journeyResultsEl.appendChild(summary);
 }
 
 function renderJourneyPanel() {
   if (!panel.classList.contains('open') || activePane !== 'journey') return;
+  // Hides the origin radios, From line, time picker and search box while a journey is
+  // selected (see .itinerary-selected in style.css). An earlier version only swapped
+  // journeyResultsEl's contents and left all of these showing above the steps.
+  journeyPaneEl.classList.toggle('itinerary-selected', Boolean(selectedItinerary));
 
   // A committed itinerary pre-empts everything else below — no origin/destination
   // controls, no re-search, just its own steps (see renderSelectedItineraryView) unless
@@ -2616,6 +2632,7 @@ function renderJourneyPanel() {
       selectedItinerary = null;
       clearJourneyWalkLines();
       journeyItineraryMissedNotice = true;
+      journeyPaneEl.classList.remove('itinerary-selected');
     } else {
       renderSelectedItineraryView();
       return;

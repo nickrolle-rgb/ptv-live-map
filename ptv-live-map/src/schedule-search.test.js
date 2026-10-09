@@ -402,6 +402,52 @@ describe('planJourney — cross-mode interchange by proximity, not name (tram<->
   });
 });
 
+describe('planJourney — never a zero-leg itinerary, and the final walk counts', () => {
+  const O = { id: 'ZO', name: 'Zero Origin', lat: -37.80000, lon: 144.95000 };
+  const B = { id: 'ZB', name: 'Right At Dest', lat: -37.83000, lon: 144.95000 };
+  const A = { id: 'ZA', name: 'Far From Dest', lat: -37.83900, lon: 144.95000 }; // ~1km from B: ~16 min walk, inside the 20-min cap
+  const reg = Object.fromEntries([O, A, B].map((s) => [s.id, [s.name, s.lat, s.lon]]));
+
+  it('returns no_journey_found rather than a walk-only "journey" when nothing is ridden', () => {
+    // Regression: origin and destination both within walking range of the same stop,
+    // with no trips at all. The origin walk seeds that stop, and previously the
+    // destination side picked it straight back up as a zero-leg result (real case: two
+    // "Collins St" station entrances merged into one stop gave Southern Cross ->
+    // Melbourne Museum a 2-minute "journey" that boarded nothing).
+    const mid = { lat: -37.81000, lon: 144.95000 };
+    const data = { stopIds: ['ZO'], routeIds: ['R'], serviceIds: ['WEEKDAY'], trips: {}, calendar: { WEEKDAY: WEEKDAY_CAL }, calendarDates: {} };
+    const result = planJourney({
+      origin: { lat: O.lat, lon: O.lon }, destination: mid, departureEpochMs: QUERY_BEFORE_0800,
+      schedules: [{ mode: 'train', data }], stopRegistry: { ZO: reg.ZO },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('no_journey_found');
+  });
+
+  it('prefers a slightly later arrival right at the destination over an earlier one with a long walk', () => {
+    // A is reached first (08:10) but leaves a ~16-minute walk; B is reached at 08:15
+    // with no walk. Ranking by arrival alone picked A (real case: a train to Melbourne
+    // Central plus a 17-minute walk, over a tram stopping at the destination itself).
+    const data = {
+      stopIds: ['ZO', 'ZA', 'ZB'], routeIds: ['RA', 'RB'], serviceIds: ['WEEKDAY'],
+      trips: {
+        TA: { r: 0, s: 0, stops: [[0, null, 8 * 3600], [1, 8 * 3600 + 600, null]] },
+        TB: { r: 1, s: 0, stops: [[0, null, 8 * 3600], [2, 8 * 3600 + 900, null]] },
+      },
+      calendar: { WEEKDAY: WEEKDAY_CAL }, calendarDates: {},
+    };
+    const result = planJourney({
+      origin: { lat: O.lat, lon: O.lon }, destination: { lat: B.lat, lon: B.lon }, departureEpochMs: QUERY_BEFORE_0800,
+      schedules: [{ mode: 'train', data }], stopRegistry: reg,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.legs).toHaveLength(1);
+    expect(result.legs[0].tripId).toBe('TB');
+    expect(result.legs[0].alightStop).toBe('Right At Dest');
+    expect(result.destination.walkMinutes).toBe(0);
+  });
+});
+
 describe('planJourney — GTFS calendar_dates exceptions', () => {
   it('excludes a normally-active service on a calendar_dates type=2 (removed) date', () => {
     const data = baseScheduleData();

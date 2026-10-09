@@ -345,12 +345,30 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
 
   // Best destination-side stop: earliest arrival among every stop_id the destination
   // candidate walk covers (multi-platform stations resolve to several stop_ids).
+  // Ranked by arrival at the stop *plus* the walk from that specific stop to the
+  // destination, not arrival alone: alone, a train reaching Melbourne Central at 10:16
+  // beat a tram stopping right at the destination a few minutes later, leaving the rider
+  // a 17-minute walk the ranking never weighed. bestArrival itself stays the arrival at
+  // the stop — that's what arriveBy/arrivalEpochMs report, as before.
   let bestStopId = null;
   let bestArrival = Infinity;
+  let bestScore = Infinity;
   destWalk.stops.forEach((stop) => {
     stop.stopIds.forEach((stopId) => {
       const arr = earliestArrival.get(stopId);
-      if (arr !== undefined && arr < bestArrival) {
+      // Only a stop actually reached by riding something counts. Without this, a stop
+      // the origin walk itself seeded could win outright and come back as a zero-leg
+      // "journey" — a real bug: two unrelated station entrances both named "Collins St"
+      // (Southern Cross and Town Hall, 1.3km apart) once got merged into one walkable
+      // stop, so Southern Cross -> Melbourne Museum "arrived" at Town Hall's entrance
+      // without boarding anything, reporting a 2-minute trip with a 20-minute walk it
+      // never counted. A walk-only result isn't a transit itinerary, whatever caused it.
+      if (arr === undefined || !predecessor.has(stopId)) return;
+      const entry = stopRegistry[stopId];
+      const walkSec = entry ? walkingMinutesTo(entry[1], entry[2], destination.lat, destination.lon) * 60 : stop.minutes * 60;
+      const score = arr + walkSec;
+      if (score < bestScore) {
+        bestScore = score;
         bestArrival = arr;
         bestStopId = stopId;
       }
@@ -410,6 +428,10 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
   // null for tram/V-Line (their stops.txt doesn't carry platform_code at all — see
   // build-stop-names.js) and for train stops without one (e.g. a single-platform stop).
   const platformFor = (stopId) => stopRegistry[stopId]?.[3] ?? null;
+  const walkMinutesToStop = (point, stopId, fallback) => {
+    const entry = stopRegistry[stopId];
+    return entry ? walkingMinutesTo(point.lat, point.lon, entry[1], entry[2]) : fallback;
+  };
   const originStopIdx = originWalk.stops.findIndex((s) => s.stopIds.includes(boardStopId));
   const originStop = originStopIdx >= 0 ? originWalk.stops[originStopIdx] : originWalk.stops[0];
   const destStop = destWalk.stops.find((s) => s.stopIds.includes(bestStopId)) ?? destWalk.stops[0];
@@ -449,8 +471,11 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
   return {
     ok: true,
     query: { date: queryDate, time: formatTimeOfDay(queryAbs) },
-    origin: { walkMinutes: Math.round(originStop.minutes), stopName: originStop.name, withinCap: originWalk.withinCap },
-    destination: { walkMinutes: Math.round(walkingMinutesTo(destination.lat, destination.lon, destStop.lat, destStop.lon)), stopName: destStop.name, withinCap: destWalk.withinCap },
+    // Walk times measured to the specific stop_id actually boarded/alighted at, not the
+    // walkable-stop cluster's nearest member — a cluster can hold several platforms or
+    // entrances, and the one the itinerary really uses isn't always the closest.
+    origin: { walkMinutes: Math.round(walkMinutesToStop(origin, boardStopId, originStop.minutes)), stopName: originStop.name, withinCap: originWalk.withinCap },
+    destination: { walkMinutes: Math.round(walkMinutesToStop(destination, bestStopId, walkingMinutesTo(destination.lat, destination.lon, destStop.lat, destStop.lon))), stopName: destStop.name, withinCap: destWalk.withinCap },
     legs: legsOut,
     totalMinutes,
     arriveBy: formatTimeOfDay(bestArrival),

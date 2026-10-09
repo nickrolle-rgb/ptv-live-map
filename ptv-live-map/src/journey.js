@@ -55,10 +55,14 @@ export function walkingMinutesTo(lat1, lon1, lat2, lon2) {
 // same-named entrance halfway across Melbourne as instantly reachable.
 const NON_BOARDING_STOP_PATTERN = /decision point|\bdp\s?\d+\b|\blift\b|\bconcourse\b|park\s*&\s*ride|bike\s*&\s*ride|kiss\s*&\s*ride|taxi\s*zone/i;
 
-// Generous enough to span every platform/entrance of one real station (even a large
-// interchange), small enough that two unrelated stations sharing a generic name (the
-// "Young St" case above) land in separate clusters instead of one contaminated entry.
-const SAME_NAME_MERGE_RADIUS_KM = 2;
+// Measured, not guessed: across every same-named stop in the bundled train/tram/V-Line
+// data, genuine parts of one station (platforms, entrances) sit at most ~0.17km from
+// their nearest same-named sibling, while every name that spans more than ~0.6km is a
+// generic street name reused at different places (Bourke St, Elizabeth St, La Trobe
+// St...). 0.3km sits in that gap. An earlier 2km value was far too loose: it merged the
+// "Collins St" entrances at Southern Cross and Town Hall (1.3km apart) into one stop,
+// letting the planner treat them as the same place.
+const SAME_NAME_MERGE_RADIUS_KM = 0.3;
 
 // stopTables: [{ mode, stopNames }], stopNames shaped stopId -> [name, lat, lon] (the
 // same tables MODES[mode].stopNames already provides in main.js) — passed in rather
