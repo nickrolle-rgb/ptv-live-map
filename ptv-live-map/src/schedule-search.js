@@ -254,156 +254,181 @@ function formatTimeOfDay(absSeconds) {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
 }
 
-// origin/destination: { lat, lon }. schedules: [{ mode, data }]. stopRegistry:
-// stopId -> [name, lat, lon] (merged across modes — safe because train and V/Line
-// share one PTV-wide stop_id space, confirmed against real data before relying on it).
-export function planJourney({ origin, destination, departureEpochMs, schedules, stopRegistry, capMinutes = DEFAULT_WALK_CAP_MINUTES }) {
-  const { dateStr: queryDate, seconds: queryTime } = melbourneDateAndSeconds(departureEpochMs);
-  const queryAbs = queryTime;
+// --- Journey options (Fastest / Simplest / Least walking) ---------------------------
+//
+// The scan runs in rounds, one per vehicle boarded: round k only boards from stops
+// reached with at most k-1 vehicles, so after round k each stop's arrival is the best
+// achievable using at most k vehicles. Keeping every round's result (not just the last)
+// is what lets "Simplest" trade time for fewer changes: a single unbounded scan only
+// remembers the earliest arrival, so a slightly slower one-vehicle journey gets
+// overwritten by a faster four-vehicle one before anything can compare them.
 
-  // stopRegistry is already merged across train+V/Line (shared stop_id space,
-  // confirmed against real data), so findWalkableStops only needs one table entry.
-  const stopTable = [{ mode: 'rail', stopNames: stopRegistry }];
-  const originWalk = findWalkableStops(origin.lat, origin.lon, stopTable, { capMinutes });
-  const destWalk = findWalkableStops(destination.lat, destination.lon, stopTable, { capMinutes });
+// How much faster an extra vehicle has to make the trip before "Simplest" accepts it.
+// 5 minutes per change, chosen by the user over an initial 10-minute suggestion.
+export const SIMPLEST_TRANSFER_PENALTY_SEC = 5 * 60;
+// "Least walking" caps each end's walk tighter than the default and weights the final
+// walk (to the destination) heavily when ranking where to get off.
+export const LEAST_WALKING_CAP_MINUTES = 8;
+const LEAST_WALKING_DEST_WEIGHT = 3;
+// Upper bound on vehicles in one itinerary. Each round is a full pass over the day's
+// connections; six vehicles is already well past any sensible Melbourne trip.
+const MAX_LEGS = 6;
 
-  if (originWalk.stops.length === 0 || destWalk.stops.length === 0) {
-    return { ok: false, reason: 'no_walkable_stops', originWalk, destWalk };
-  }
-
-  const interchangeGroups = getInterchangeGroups(stopRegistry);
-
-  // Build connections for the query date and the day before (to catch post-midnight
-  // overflow trips whose service belongs to the previous service day).
-  const connections = [];
-  schedules.forEach(({ mode, data }) => {
-    [queryDate, addDays(queryDate, -1)].forEach((serviceDate) => {
-      const active = resolveActiveServices(data, serviceDate);
-      if (active.size === 0) return;
-      buildConnections(data, mode, serviceDate, queryDate, active, connections);
+// Building + sorting a day's connections is most of a query's cost (~250ms on real data)
+// and depends only on the query date, not the departure time — so it's cached per date.
+// planJourneyArrivingBy's binary search runs a dozen probes on the same date, all of
+// which now share one build.
+const connectionsCache = new WeakMap(); // schedules array -> Map(queryDate -> connections)
+function getConnections(schedules, queryDate) {
+  let byDate = connectionsCache.get(schedules);
+  if (!byDate) { byDate = new Map(); connectionsCache.set(schedules, byDate); }
+  let connections = byDate.get(queryDate);
+  if (!connections) {
+    connections = [];
+    // The query date and the day before (to catch post-midnight overflow trips whose
+    // service belongs to the previous service day).
+    schedules.forEach(({ mode, data }) => {
+      [queryDate, addDays(queryDate, -1)].forEach((serviceDate) => {
+        const active = resolveActiveServices(data, serviceDate);
+        if (active.size === 0) return;
+        buildConnections(data, mode, serviceDate, queryDate, active, connections);
+      });
     });
-  });
-  connections.sort((a, b) => a.depTime - b.depTime);
+    connections.sort((a, b) => a.depTime - b.depTime);
+    // Bounded: a warm function instance only ever sees a handful of dates.
+    if (byDate.size >= 3) byDate.delete(byDate.keys().next().value);
+    byDate.set(queryDate, connections);
+  }
+  return connections;
+}
 
-  const earliestArrival = new Map(); // stopId -> absSeconds
-  // stopId -> hop, where a hop is an immutable snapshot: { ..., prevHop: <hop for
-  // fromStopId at the moment this hop was created, or null>. Capturing prevHop by
-  // reference (not re-resolving fromStopId through this Map later) matters — see the
-  // long comment at the backtrack site below for why a naive "look fromStopId up in this
-  // Map when reconstructing" approach can produce an unfollowable cycle.
-  const predecessor = new Map();
-  const inTrip = new Set(); // tripId currently boarded/continuing
+function firstIndexAtOrAfter(connections, t) {
+  let lo = 0;
+  let hi = connections.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (connections[mid].depTime < t) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
 
+// Origin walk -> Map(stopId -> arrival seconds), from a findWalkableStops result.
+function seedArrivals(originWalk, queryAbs) {
+  const seeds = new Map();
   originWalk.stops.forEach((stop) => {
     const arriveAt = queryAbs + Math.ceil(stop.minutes * 60);
     stop.stopIds.forEach((stopId) => {
-      const existing = earliestArrival.get(stopId);
-      if (existing === undefined || arriveAt < existing) earliestArrival.set(stopId, arriveAt);
+      const existing = seeds.get(stopId);
+      if (existing === undefined || arriveAt < existing) seeds.set(stopId, arriveAt);
     });
   });
+  return seeds;
+}
 
-  // Returns the interchange-group member stop whose earliest arrival actually permits
-  // boarding this connection — may differ from `stopId` itself when boarding requires a
-  // same-station platform transfer (e.g. the rider's earliest arrival is at S2, but this
-  // connection departs from a different stop_id, S2B, sharing S2's station name). Null
-  // if nothing in the group permits it in time.
+// Returns rounds[k-1] = { arrival, predecessor } for "at most k vehicles". A hop is an
+// immutable snapshot { tripId, routeId, mode, fromStopId, toStopId, depTime, arrTime,
+// prevHop, legs, rootStopId }:
+// - prevHop on a continuing trip is that same trip's previous hop (not whatever hop
+//   currently holds fromStopId's best arrival, which may belong to another trip); on a
+//   fresh boarding it's the hop that reached the boarding stop in the previous round.
+//   Captured by reference at creation, so reconstruction is a DAG walk that later
+//   improvements can't invalidate (re-resolving through a live Map once produced an
+//   unfollowable cycle on V/Line's Richmond<->Flinders St runs).
+// - legs counts distinct vehicles along the chain; rootStopId is the origin-seeded stop
+//   the chain started from.
+// - Boarding from a different stop_id than the connection's own goes through the
+//   interchange groups (nearby platforms/stops) and links via the stop actually arrived
+//   at, not c.fromStopId — linking via c.fromStopId was a real bug once: the chain
+//   truncated at the first platform change, dropping every earlier leg.
+function scanRounds(connections, startIdx, seeds, interchangeGroups) {
+  const rounds = [];
+  let prevArrival = seeds;
+  let prevPredecessor = new Map();
+
   function boardingStop(stopId, depTime) {
     const edges = interchangeGroups.get(stopId) || [{ stopId, transferSec: 0 }];
     for (const { stopId: fromStop, transferSec } of edges) {
-      const arr = earliestArrival.get(fromStop);
+      const arr = prevArrival.get(fromStop);
       if (arr !== undefined && arr + transferSec <= depTime) return fromStop;
     }
     return null;
   }
 
-  for (const c of connections) {
-    if (c.depTime < queryAbs) continue;
-    // inTrip.has(c.tripId): already riding this trip, so the boarding stop is simply
-    // wherever it was already boarded (c.fromStopId itself) — no interchange lookup
-    // needed or correct here, since earliestArrival was never separately recorded for
-    // every intermediate stop_id of a trip already being ridden.
-    const boardFromStop = inTrip.has(c.tripId) ? c.fromStopId : boardingStop(c.fromStopId, c.depTime);
-    if (boardFromStop === null) continue;
-    inTrip.add(c.tripId);
-    const currentBest = earliestArrival.get(c.toStopId);
-    if (currentBest !== undefined && currentBest <= c.arrTime) continue;
-    earliestArrival.set(c.toStopId, c.arrTime);
-    predecessor.set(c.toStopId, {
-      tripId: c.tripId, routeId: c.routeId, mode: c.mode,
-      fromStopId: c.fromStopId, toStopId: c.toStopId, depTime: c.depTime, arrTime: c.arrTime,
-      // Linked via boardFromStop, not c.fromStopId — see boardingStop's comment above.
-      // Using c.fromStopId directly here was a real bug this file's test suite caught:
-      // predecessor has no entry for a stop_id nobody ever actually arrived at via a
-      // connection, so the chain silently truncated at the first platform-transfer,
-      // dropping every earlier leg from the reconstructed itinerary while totalMinutes/
-      // arriveBy (computed independently, from earliestArrival) still reported the full,
-      // correct journey time — an itinerary that claimed a duration its own displayed
-      // legs didn't account for.
-      prevHop: predecessor.get(boardFromStop) ?? null,
-    });
-  }
-
-  // Best destination-side stop: earliest arrival among every stop_id the destination
-  // candidate walk covers (multi-platform stations resolve to several stop_ids).
-  // Ranked by arrival at the stop *plus* the walk from that specific stop to the
-  // destination, not arrival alone: alone, a train reaching Melbourne Central at 10:16
-  // beat a tram stopping right at the destination a few minutes later, leaving the rider
-  // a 17-minute walk the ranking never weighed. bestArrival itself stays the arrival at
-  // the stop — that's what arriveBy/arrivalEpochMs report, as before.
-  let bestStopId = null;
-  let bestArrival = Infinity;
-  let bestScore = Infinity;
-  destWalk.stops.forEach((stop) => {
-    stop.stopIds.forEach((stopId) => {
-      const arr = earliestArrival.get(stopId);
-      // Only a stop actually reached by riding something counts. Without this, a stop
-      // the origin walk itself seeded could win outright and come back as a zero-leg
-      // "journey" — a real bug: two unrelated station entrances both named "Collins St"
-      // (Southern Cross and Town Hall, 1.3km apart) once got merged into one walkable
-      // stop, so Southern Cross -> Melbourne Museum "arrived" at Town Hall's entrance
-      // without boarding anything, reporting a 2-minute trip with a 20-minute walk it
-      // never counted. A walk-only result isn't a transit itinerary, whatever caused it.
-      if (arr === undefined || !predecessor.has(stopId)) return;
-      const entry = stopRegistry[stopId];
-      const walkSec = entry ? walkingMinutesTo(entry[1], entry[2], destination.lat, destination.lon) * 60 : stop.minutes * 60;
-      const score = arr + walkSec;
-      if (score < bestScore) {
-        bestScore = score;
-        bestArrival = arr;
-        bestStopId = stopId;
+  for (let k = 1; k <= MAX_LEGS; k++) {
+    const arrival = new Map(prevArrival);
+    const predecessor = new Map(prevPredecessor);
+    const tripHop = new Map(); // tripId -> its latest hop this round
+    let improved = false;
+    for (let i = startIdx; i < connections.length; i++) {
+      const c = connections[i];
+      let prev = tripHop.get(c.tripId);
+      let rootStopId;
+      if (prev === undefined) {
+        const boardFrom = boardingStop(c.fromStopId, c.depTime);
+        if (boardFrom === null) continue;
+        prev = prevPredecessor.get(boardFrom) ?? null;
+        if (prev === null) {
+          if (!seeds.has(boardFrom)) continue;
+          rootStopId = boardFrom;
+        }
       }
+      const hop = {
+        tripId: c.tripId, routeId: c.routeId, mode: c.mode,
+        fromStopId: c.fromStopId, toStopId: c.toStopId, depTime: c.depTime, arrTime: c.arrTime,
+        prevHop: prev,
+        legs: prev ? prev.legs + (prev.tripId === c.tripId ? 0 : 1) : 1,
+        rootStopId: prev ? prev.rootStopId : rootStopId,
+      };
+      tripHop.set(c.tripId, hop);
+      const best = arrival.get(c.toStopId);
+      if (best === undefined || c.arrTime < best) {
+        arrival.set(c.toStopId, c.arrTime);
+        predecessor.set(c.toStopId, hop);
+        improved = true;
+      }
+    }
+    rounds.push({ arrival, predecessor });
+    if (!improved) break;
+    prevArrival = arrival;
+    prevPredecessor = predecessor;
+  }
+  return rounds;
+}
+
+// Picks the best destination-side hop across every round. Score = arrival at the stop
+// + destWeight x the walk from that specific stop to the destination + transferPenalty
+// for each vehicle beyond the first. Only stops actually reached by riding count: a stop
+// the origin walk itself seeded could otherwise win as a zero-leg "journey" (a real bug:
+// two "Collins St" station entrances 1.3km apart were once merged into one walkable
+// stop, giving Southern Cross -> Melbourne Museum a 2-minute trip that boarded nothing).
+// Walk is weighed at all because ranking by arrival alone once chose a train to
+// Melbourne Central plus a 17-minute walk over a tram stopping at the destination.
+function pickBest(rounds, destWalk, destination, stopRegistry, { transferPenaltySec = 0, destWeight = 1 } = {}) {
+  let best = null;
+  rounds.forEach(({ arrival, predecessor }) => {
+    destWalk.stops.forEach((stop) => {
+      stop.stopIds.forEach((stopId) => {
+        const hop = predecessor.get(stopId);
+        if (!hop) return;
+        const arr = arrival.get(stopId);
+        const entry = stopRegistry[stopId];
+        const walkSec = entry ? walkingMinutesTo(entry[1], entry[2], destination.lat, destination.lon) * 60 : stop.minutes * 60;
+        const score = arr + destWeight * walkSec + transferPenaltySec * (hop.legs - 1);
+        if (!best || score < best.score) best = { score, stopId, arrival: arr, hop };
+      });
     });
   });
+  return best;
+}
 
-  if (bestStopId === null) {
-    return { ok: false, reason: 'no_journey_found', originWalk, destWalk };
-  }
-
-  // Walk the hop chain back to an origin-seeded stop (prevHop null), merging consecutive
-  // hops on the same trip into a single ride leg.
-  //
-  // This walks prevHop references, not a fresh Map.get(fromStopId) lookup — deliberately.
-  // predecessor is last-write-wins as the sweep finds improvements, so by the time
-  // reconstruction runs, predecessor.get(someStopId) reflects that stop's *final* best
-  // arrival, which isn't necessarily the one this hop's connection actually boarded
-  // against. Two different connections can each legitimately improve the other's stop
-  // (confirmed against real data: V/Line's Richmond<->Flinders St connections run both
-  // directions), which, if reconstruction re-resolves fromStopId through the live Map,
-  // can produce predecessor[A] and predecessor[B] pointing at each other — an
-  // unfollowable cycle despite each being individually valid when it was written.
-  // prevHop sidesteps this entirely: it's captured once, at the moment this hop is
-  // created, as a snapshot of whatever hop.fromStopId's chain was *then* — and since hop
-  // objects are never mutated after creation (only replaced), that snapshot can't later
-  // be invalidated by a subsequent improvement. Following prevHop is therefore a DAG walk
-  // by construction, not just a cycle-guarded one.
+// Turns a chosen hop chain into the API's itinerary shape.
+function buildItinerary({ best, origin, destination, departureEpochMs, queryDate, queryAbs, originWalk, destWalk, stopRegistry }) {
   const hops = [];
-  let hop = predecessor.get(bestStopId) ?? null;
-  while (hop) {
-    hops.push(hop);
-    hop = hop.prevHop;
-  }
+  for (let hop = best.hop; hop; hop = hop.prevHop) hops.push(hop);
   hops.reverse();
-  const boardStopId = hops.length > 0 ? hops[0].fromStopId : bestStopId; // where the walking leg from origin lands
+  const boardStopId = hops[0].fromStopId;
+  const bestStopId = best.stopId;
 
   const legs = [];
   hops.forEach((hop) => {
@@ -413,13 +438,9 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
       last.alightTime = hop.arrTime;
     } else {
       legs.push({
-        mode: hop.mode,
-        routeId: hop.routeId,
-        tripId: hop.tripId,
-        boardStopId: hop.fromStopId,
-        boardTime: hop.depTime,
-        alightStopId: hop.toStopId,
-        alightTime: hop.arrTime,
+        mode: hop.mode, routeId: hop.routeId, tripId: hop.tripId,
+        boardStopId: hop.fromStopId, boardTime: hop.depTime,
+        alightStopId: hop.toStopId, alightTime: hop.arrTime,
       });
     }
   });
@@ -432,14 +453,13 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
     const entry = stopRegistry[stopId];
     return entry ? walkingMinutesTo(point.lat, point.lon, entry[1], entry[2]) : fallback;
   };
-  const originStopIdx = originWalk.stops.findIndex((s) => s.stopIds.includes(boardStopId));
-  const originStop = originStopIdx >= 0 ? originWalk.stops[originStopIdx] : originWalk.stops[0];
+  const originStop = originWalk.stops.find((s) => s.stopIds.includes(boardStopId))
+    ?? originWalk.stops.find((s) => s.stopIds.includes(hops[0].rootStopId))
+    ?? originWalk.stops[0];
   const destStop = destWalk.stops.find((s) => s.stopIds.includes(bestStopId)) ?? destWalk.stops[0];
 
   const legsOut = legs.map((leg, i) => {
     const prev = legs[i - 1];
-    const transferMinutes = prev ? Math.round((leg.boardTime - prev.alightTime) / 60) : null;
-    const changedPlatform = prev ? prev.alightStopId !== leg.boardStopId : false;
     return {
       mode: leg.mode,
       routeId: leg.routeId,
@@ -450,104 +470,199 @@ export function planJourney({ origin, destination, departureEpochMs, schedules, 
       alightStop: nameFor(leg.alightStopId),
       alightPlatform: platformFor(leg.alightStopId),
       alightTime: formatTimeOfDay(leg.alightTime),
-      transferMinutes,
-      changedPlatform,
+      transferMinutes: prev ? Math.round((leg.boardTime - prev.alightTime) / 60) : null,
+      changedPlatform: prev ? prev.alightStopId !== leg.boardStopId : false,
     };
   });
 
-  // totalMinutes deliberately does NOT come from (bestArrival - queryAbs) / 60 — both
-  // are naive wall-clock-digit seconds (see buildConnections/melbourneWallClockToEpochMs
+  // totalMinutes deliberately does NOT come from (arrival - queryAbs) / 60 — both are
+  // naive wall-clock-digit seconds (see buildConnections/melbourneWallClockToEpochMs
   // headers), and diffing them directly silently gains or loses an hour for any journey
   // whose *scheduled* span crosses a Melbourne DST transition (confirmed: a real trip
   // spanning 2026-10-04's spring-forward gap reported 190 minutes for what is actually a
   // 130-minute wait+journey in real time). Converting the arrival's wall-clock reading
-  // back to a real epoch via melbourneWallClockToEpochMs and diffing that against the
-  // real departureEpochMs the caller supplied gives the true elapsed duration instead.
-  const arrivalDateStr = addDays(queryDate, Math.floor(bestArrival / SECONDS_PER_DAY));
-  const arrivalSecondsOfDay = ((bestArrival % SECONDS_PER_DAY) + SECONDS_PER_DAY) % SECONDS_PER_DAY;
+  // back to a real epoch and diffing against the real departureEpochMs gives the true
+  // elapsed duration instead.
+  const arrivalDateStr = addDays(queryDate, Math.floor(best.arrival / SECONDS_PER_DAY));
+  const arrivalSecondsOfDay = ((best.arrival % SECONDS_PER_DAY) + SECONDS_PER_DAY) % SECONDS_PER_DAY;
   const arrivalEpochMs = melbourneWallClockToEpochMs(arrivalDateStr, arrivalSecondsOfDay);
-  const totalMinutes = Math.round((arrivalEpochMs - departureEpochMs) / 60000);
 
   return {
     ok: true,
     query: { date: queryDate, time: formatTimeOfDay(queryAbs) },
     // Walk times measured to the specific stop_id actually boarded/alighted at, not the
-    // walkable-stop cluster's nearest member — a cluster can hold several platforms or
-    // entrances, and the one the itinerary really uses isn't always the closest.
+    // walkable-stop cluster's nearest member.
     origin: { walkMinutes: Math.round(walkMinutesToStop(origin, boardStopId, originStop.minutes)), stopName: originStop.name, withinCap: originWalk.withinCap },
     destination: { walkMinutes: Math.round(walkMinutesToStop(destination, bestStopId, walkingMinutesTo(destination.lat, destination.lon, destStop.lat, destStop.lon))), stopName: destStop.name, withinCap: destWalk.withinCap },
     legs: legsOut,
-    totalMinutes,
-    arriveBy: formatTimeOfDay(bestArrival),
+    totalMinutes: Math.round((arrivalEpochMs - departureEpochMs) / 60000),
+    arriveBy: formatTimeOfDay(best.arrival),
     arrivalEpochMs,
   };
 }
 
-// "Arrive by Z" — answered by binary-searching planJourney's own departure time, not a
-// separate reverse-CSA implementation. This relies on one property: querying a later
-// departure can only ever see a subset of an earlier query's connections (anything with
-// c.depTime < queryAbs is dropped), so the resulting arrival time is non-decreasing as
-// departure time increases. That makes "does departing at time t still arrive by Z" a
-// simple sorted-boolean-array search — the latest still-valid t is the answer — without
-// writing and separately maintaining a second, reverse-direction version of the CSA scan
-// (and re-risking the same class of reconstruction bug the forward version had).
-// Costs ~11 forward planJourney calls (log2 of the search window in minutes) instead of
-// one; accepted as the simpler-to-get-correct tradeoff, matching this file's existing
-// CSA-over-RAPTOR rationale.
+const OPTION_KINDS = ['fastest', 'simplest', 'least_walking'];
+
+// Two options are the same journey if they ride the same vehicles between the same stops.
+function itinerarySignature(itinerary) {
+  return itinerary.legs.map((l) => `${l.tripId}:${l.boardStop}>${l.alightStop}`).join('|');
+}
+
+// One planner run per departure time, returning every option kind that found a
+// journey: { ok, options: [{ kinds: [...], ...itinerary }] }. Options riding the same
+// vehicles end-to-end are merged into one entry carrying every kind they satisfy (a
+// journey that's both fastest and simplest shows once, labelled both). Fastest and
+// Simplest share one scan; Least walking needs its own because its tighter walk cap
+// changes which stops get seeded at all.
+export function planJourneyOptions({ origin, destination, departureEpochMs, schedules, stopRegistry, capMinutes = DEFAULT_WALK_CAP_MINUTES }) {
+  const { dateStr: queryDate, seconds: queryAbs } = melbourneDateAndSeconds(departureEpochMs);
+
+  // stopRegistry is already merged across modes, so findWalkableStops only needs one table.
+  const stopTable = [{ mode: 'rail', stopNames: stopRegistry }];
+  const originWalk = findWalkableStops(origin.lat, origin.lon, stopTable, { capMinutes });
+  const destWalk = findWalkableStops(destination.lat, destination.lon, stopTable, { capMinutes });
+  if (originWalk.stops.length === 0 || destWalk.stops.length === 0) {
+    return { ok: false, reason: 'no_walkable_stops', originWalk, destWalk };
+  }
+
+  const interchangeGroups = getInterchangeGroups(stopRegistry);
+  const connections = getConnections(schedules, queryDate);
+  const startIdx = firstIndexAtOrAfter(connections, queryAbs);
+  const ctx = { origin, destination, departureEpochMs, queryDate, queryAbs, stopRegistry };
+
+  const picks = [];
+  const rounds = scanRounds(connections, startIdx, seedArrivals(originWalk, queryAbs), interchangeGroups);
+  const fastest = pickBest(rounds, destWalk, destination, stopRegistry);
+  if (fastest) picks.push(['fastest', fastest, originWalk, destWalk]);
+  const simplest = pickBest(rounds, destWalk, destination, stopRegistry, { transferPenaltySec: SIMPLEST_TRANSFER_PENALTY_SEC });
+  if (simplest) picks.push(['simplest', simplest, originWalk, destWalk]);
+
+  const lwCap = Math.min(capMinutes, LEAST_WALKING_CAP_MINUTES);
+  const lwOriginWalk = findWalkableStops(origin.lat, origin.lon, stopTable, { capMinutes: lwCap });
+  const lwDestWalk = findWalkableStops(destination.lat, destination.lon, stopTable, { capMinutes: lwCap });
+  // Only meaningful when both ends genuinely have a stop inside the tighter cap —
+  // findWalkableStops falls back to the single nearest stop otherwise, which would just
+  // reproduce a long walk under a "Least walking" label.
+  if (lwOriginWalk.withinCap && lwDestWalk.withinCap && lwOriginWalk.stops.length && lwDestWalk.stops.length) {
+    const lwRounds = scanRounds(connections, startIdx, seedArrivals(lwOriginWalk, queryAbs), interchangeGroups);
+    const leastWalking = pickBest(lwRounds, lwDestWalk, destination, stopRegistry, { destWeight: LEAST_WALKING_DEST_WEIGHT });
+    if (leastWalking) picks.push(['least_walking', leastWalking, lwOriginWalk, lwDestWalk]);
+  }
+
+  if (picks.length === 0) return { ok: false, reason: 'no_journey_found', originWalk, destWalk };
+
+  const options = [];
+  picks.forEach(([kind, best, oWalk, dWalk]) => {
+    const itinerary = buildItinerary({ ...ctx, best, originWalk: oWalk, destWalk: dWalk });
+    const existing = options.find((o) => itinerarySignature(o) === itinerarySignature(itinerary));
+    if (existing) existing.kinds.push(kind);
+    else options.push({ kinds: [kind], ...itinerary });
+  });
+  return { ok: true, options };
+}
+
+// origin/destination: { lat, lon }. schedules: [{ mode, data }]. stopRegistry:
+// stopId -> [name, lat, lon, platform] (merged across modes). Returns just the Fastest
+// option in the original single-itinerary shape — kept for existing callers and tests;
+// new callers should use planJourneyOptions.
+export function planJourney(args) {
+  const result = planJourneyOptions(args);
+  if (!result.ok) return result;
+  const { kinds, ...fastest } = result.options.find((o) => o.kinds.includes('fastest'));
+  return fastest;
+}
+
+// "Arrive by Z" — answered by binary-searching planJourneyOptions' own departure time,
+// not a separate reverse-CSA implementation. This relies on one property: querying a
+// later departure can only ever see a subset of an earlier query's connections
+// (anything with c.depTime < queryAbs is dropped), so the earliest possible arrival is
+// non-decreasing as departure time increases. That makes "does departing at time t
+// still arrive by Z" a sorted-boolean search — the latest still-valid t is the answer —
+// without writing and maintaining a reverse-direction version of the scan.
+//
+// Each option kind gets its own search (the latest departure whose Fastest arrives in
+// time isn't necessarily the latest whose Simplest does). Probes are memoized by
+// minute, so the three searches share most of their work, and each probe reuses the
+// cached connections for the day (see getConnections), so a probe is only the scan.
+//
+// The monotonicity above is strict for Fastest. Simplest and Least walking rank by more
+// than arrival, so their search can occasionally settle on a slightly earlier departure
+// than the latest that would work — the result always genuinely arrives by Z (each
+// probe's arrival is checked directly), it just may not be the last possible one.
 const ARRIVE_BY_STEP_MS = 60 * 1000; // minute-granularity search, matching this planner's own display precision
 
-export function planJourneyArrivingBy({
+export function planJourneyOptionsArrivingBy({
   origin, destination, arriveByEpochMs, schedules, stopRegistry, capMinutes = DEFAULT_WALK_CAP_MINUTES,
 }) {
-  function attempt(departureEpochMs) {
-    const result = planJourney({ origin, destination, departureEpochMs, schedules, stopRegistry, capMinutes });
-    // Uses planJourney's own real-epoch arrivalEpochMs directly rather than
-    // re-deriving departureEpochMs + totalMinutes*60000 — that reconstruction is exactly
-    // what totalMinutes's own header warns against relying on for real-epoch math.
-    const arrivalEpochMs = result.ok ? result.arrivalEpochMs : Infinity;
-    return { result, arrivalEpochMs };
-  }
+  const probes = new Map();
+  const probe = (minute) => {
+    if (!probes.has(minute)) {
+      probes.set(minute, planJourneyOptions({
+        origin, destination, departureEpochMs: minute * ARRIVE_BY_STEP_MS, schedules, stopRegistry, capMinutes,
+      }));
+    }
+    return probes.get(minute);
+  };
+  // Uses the planner's own real-epoch arrivalEpochMs directly rather than re-deriving
+  // departure + totalMinutes — see buildItinerary's totalMinutes comment for why.
+  const optionFor = (result, kind) => (result.ok ? result.options.find((o) => o.kinds.includes(kind)) : undefined);
 
   // Restricted to departures on the SAME Melbourne calendar day as the target arrival
   // (from local midnight up to the target time), not an arbitrary lookback window. This
-  // isn't just a scope simplification — it's what keeps the binary search below correct.
-  // The non-decreasing-arrival property above only holds while queryDate(t) — and
-  // therefore the exact connections array planJourney filters — stays fixed. Once a
-  // search window crosses local midnight, buildConnections rebuilds against a different
-  // D/D-1 pair per candidate t, and a recurring daily service can make "still reachable"
-  // flip true/false/true as t increases, which breaks binary search's core assumption
-  // (confirmed by hand-tracing a 24h-lookback version against this file's synthetic
-  // weekday fixture before landing on this same-day bound instead). Practical effect: an
-  // overnight trip (e.g. depart 11pm, arrive by 6am) needs the query framed as arriving
-  // "tomorrow", not a lookback past midnight from an evening departure.
+  // isn't just a scope simplification — it's what keeps the binary search correct. The
+  // non-decreasing-arrival property only holds while queryDate(t) — and therefore the
+  // exact connections planJourneyOptions scans — stays fixed. Once a window crosses
+  // local midnight, a recurring daily service can make "still reachable" flip
+  // true/false/true as t increases (confirmed by hand-tracing a 24h-lookback version
+  // against the synthetic weekday fixture). Practical effect: an overnight trip needs
+  // the query framed as arriving "tomorrow", not a lookback past midnight.
   const { seconds: targetSeconds } = melbourneDateAndSeconds(arriveByEpochMs);
   const hiMin = Math.floor(arriveByEpochMs / ARRIVE_BY_STEP_MS);
   const loMin = hiMin - Math.floor(targetSeconds / 60);
 
-  // A failure here that isn't time-dependent (no walkable stop at all near the origin or
-  // destination) will fail identically at every departure time in the window — surface
-  // that specific reason immediately rather than a generic "unreachable".
-  const hiAttempt = attempt(hiMin * ARRIVE_BY_STEP_MS);
-  if (!hiAttempt.result.ok && hiAttempt.result.reason === 'no_walkable_stops') return hiAttempt.result;
+  // A failure that isn't time-dependent (no walkable stop at all near either end) fails
+  // identically at every departure time — surface that specific reason immediately.
+  const hiResult = probe(hiMin);
+  if (!hiResult.ok && hiResult.reason === 'no_walkable_stops') return hiResult;
 
-  let lo = loMin;
-  let hi = hiMin;
-  let bestMin = null;
-  let bestResult = null;
-  while (lo <= hi) {
-    const mid = lo + Math.floor((hi - lo) / 2);
-    const { result, arrivalEpochMs } = attempt(mid * ARRIVE_BY_STEP_MS);
-    if (arrivalEpochMs <= arriveByEpochMs) {
-      bestMin = mid;
-      bestResult = result;
-      lo = mid + 1; // this departure works — try a later (closer to the target) one
-    } else {
-      hi = mid - 1; // too late to arrive in time — try an earlier departure
+  const picks = [];
+  OPTION_KINDS.forEach((kind) => {
+    let lo = loMin;
+    let hi = hiMin;
+    let found = null;
+    while (lo <= hi) {
+      const mid = lo + Math.floor((hi - lo) / 2);
+      const option = optionFor(probe(mid), kind);
+      if (option && option.arrivalEpochMs <= arriveByEpochMs) {
+        found = option;
+        lo = mid + 1; // this departure works — try a later (closer to the target) one
+      } else {
+        hi = mid - 1; // too late to arrive in time — try an earlier departure
+      }
     }
-  }
+    if (found) picks.push([kind, found]);
+  });
 
-  if (bestMin === null) {
-    return { ok: false, reason: 'unreachable_by_target' };
-  }
-  return { ...bestResult, requestedArriveBy: formatTimeOfDay(targetSeconds) };
+  if (picks.length === 0) return { ok: false, reason: 'unreachable_by_target' };
+
+  // Merge kinds that settled on the same journey (possibly found via different probes).
+  const options = [];
+  picks.forEach(([kind, option]) => {
+    const signature = itinerarySignature(option);
+    const existing = options.find((o) => itinerarySignature(o) === signature);
+    if (existing) existing.kinds.push(kind);
+    else options.push({ ...option, kinds: [kind] });
+  });
+  return { ok: true, options, requestedArriveBy: formatTimeOfDay(targetSeconds) };
+}
+
+// Fastest-only "arrive by", in the original single-itinerary shape — kept for existing
+// callers and tests; new callers should use planJourneyOptionsArrivingBy.
+export function planJourneyArrivingBy(args) {
+  const result = planJourneyOptionsArrivingBy(args);
+  if (!result.ok) return result;
+  const fastest = result.options.find((o) => o.kinds.includes('fastest'));
+  if (!fastest) return { ok: false, reason: 'unreachable_by_target' };
+  const { kinds, ...itinerary } = fastest;
+  return { ...itinerary, requestedArriveBy: result.requestedArriveBy };
 }

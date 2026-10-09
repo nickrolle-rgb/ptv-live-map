@@ -16,7 +16,7 @@ import tramSchedule from '../src/data/schedule/tram-schedule.json' with { type: 
 import trainStopNames from '../src/data/train-stop-names.json' with { type: 'json' };
 import vlineStopNames from '../src/data/vline-stop-names.json' with { type: 'json' };
 import tramStopNames from '../src/data/tram-stop-names.json' with { type: 'json' };
-import { planJourney, planJourneyArrivingBy } from '../src/schedule-search.js';
+import { planJourneyOptions, planJourneyOptionsArrivingBy } from '../src/schedule-search.js';
 
 // Built once at module scope, not per-request, so it's reused across warm invocations
 // of this function instance (and so schedule-search.js's interchange-group cache, keyed
@@ -38,6 +38,16 @@ const schedules = [
 function parseCoord(value) {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+// Responds with every option (Fastest / Simplest / Least walking, merged where they're
+// the same journey) under `options`, and also spreads the Fastest option's fields at the
+// top level — the shape this endpoint returned before options existed, so a client
+// still running an older cached bundle keeps working.
+function withFastestAtTop(result) {
+  if (!result.ok) return result;
+  const fastest = result.options.find((o) => o.kinds.includes('fastest')) ?? result.options[0];
+  return { ...fastest, ...result };
 }
 
 export default function handler(req, res) {
@@ -63,14 +73,14 @@ export default function handler(req, res) {
         res.status(400).json({ ok: false, reason: 'invalid_arrive_by' });
         return;
       }
-      const result = planJourneyArrivingBy({
+      const result = planJourneyOptionsArrivingBy({
         origin: { lat: originLat, lon: originLon },
         destination: { lat: destLat, lon: destLon },
         arriveByEpochMs,
         schedules,
         stopRegistry,
       });
-      res.status(200).json(result);
+      res.status(200).json(withFastestAtTop(result));
       return;
     }
 
@@ -79,14 +89,14 @@ export default function handler(req, res) {
       res.status(400).json({ ok: false, reason: 'invalid_departure' });
       return;
     }
-    const result = planJourney({
+    const result = planJourneyOptions({
       origin: { lat: originLat, lon: originLon },
       destination: { lat: destLat, lon: destLon },
       departureEpochMs,
       schedules,
       stopRegistry,
     });
-    res.status(200).json(result);
+    res.status(200).json(withFastestAtTop(result));
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, reason: 'planning_failed' });

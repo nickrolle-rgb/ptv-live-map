@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { melbourneDateAndSeconds, melbourneWallClockToEpochMs, planJourney, planJourneyArrivingBy } from './schedule-search.js';
+import { melbourneDateAndSeconds, melbourneWallClockToEpochMs, planJourney, planJourneyArrivingBy, planJourneyOptions } from './schedule-search.js';
 
 // ---------------------------------------------------------------------------
 // melbourneDateAndSeconds — DST boundary tests.
@@ -445,6 +445,44 @@ describe('planJourney — never a zero-leg itinerary, and the final walk counts'
     expect(result.legs[0].tripId).toBe('TB');
     expect(result.legs[0].alightStop).toBe('Right At Dest');
     expect(result.destination.walkMinutes).toBe(0);
+  });
+});
+
+describe('planJourneyOptions — Fastest vs Simplest (5 minutes per extra vehicle)', () => {
+  const O = { id: 'SO', name: 'Opt Origin', lat: -37.80000, lon: 144.95000 };
+  const M = { id: 'SM', name: 'Opt Mid', lat: -37.83000, lon: 144.95000 };
+  const D = { id: 'SD', name: 'Opt Dest', lat: -37.86000, lon: 144.95000 };
+  const reg = Object.fromEntries([O, M, D].map((s) => [s.id, [s.name, s.lat, s.lon]]));
+  // Two vehicles via M arrive 08:20; one direct vehicle arrives at directArrival.
+  const network = (directArrival) => ({
+    stopIds: ['SO', 'SM', 'SD'], routeIds: ['R1', 'R2', 'R3'], serviceIds: ['WEEKDAY'],
+    trips: {
+      T1: { r: 0, s: 0, stops: [[0, null, 8 * 3600], [1, 8 * 3600 + 600, null]] },
+      T2: { r: 1, s: 0, stops: [[1, null, 8 * 3600 + 780], [2, 8 * 3600 + 1200, null]] },
+      DIRECT: { r: 2, s: 0, stops: [[0, null, 8 * 3600 + 300], [2, directArrival, null]] },
+    },
+    calendar: { WEEKDAY: WEEKDAY_CAL }, calendarDates: {},
+  });
+  const plan = (directArrival) => planJourneyOptions({
+    origin: { lat: O.lat, lon: O.lon }, destination: { lat: D.lat, lon: D.lon }, departureEpochMs: QUERY_BEFORE_0800,
+    schedules: [{ mode: 'train', data: network(directArrival) }], stopRegistry: reg,
+  });
+  const byKind = (result, kind) => result.options.find((o) => o.kinds.includes(kind));
+
+  it('Simplest takes the one-vehicle trip when the extra change saves under 5 minutes', () => {
+    const result = plan(8 * 3600 + 1380); // direct arrives 08:23 — only 3 minutes slower
+    expect(byKind(result, 'fastest').legs.map((l) => l.tripId)).toEqual(['T1', 'T2']);
+    expect(byKind(result, 'simplest').legs.map((l) => l.tripId)).toEqual(['DIRECT']);
+    expect(byKind(result, 'simplest').arriveBy).toBe('08:23');
+  });
+
+  it('Simplest accepts the change when it saves more than 5 minutes, merging with Fastest', () => {
+    const result = plan(8 * 3600 + 1800); // direct arrives 08:30 — 10 minutes slower
+    const fastest = byKind(result, 'fastest');
+    expect(fastest.legs.map((l) => l.tripId)).toEqual(['T1', 'T2']);
+    expect(fastest.kinds).toEqual(expect.arrayContaining(['fastest', 'simplest']));
+    // Merged, not listed twice.
+    expect(result.options.filter((o) => o.legs.map((l) => l.tripId).join() === 'T1,T2')).toHaveLength(1);
   });
 });
 

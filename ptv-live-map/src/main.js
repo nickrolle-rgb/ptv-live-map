@@ -2484,18 +2484,26 @@ const PLANNED_JOURNEY_ERROR_MESSAGES = {
   request_failed: "Couldn't reach the timetable lookup — try again shortly.",
 };
 
-function renderPlannedJourneyCard(result) {
+const OPTION_KIND_LABELS = { fastest: 'Fastest', simplest: 'Simplest', least_walking: 'Least walking' };
+
+// One timetabled option. kinds lists every label this journey earned (one journey can be
+// both Fastest and Simplest, say) — the server merges identical journeys, so each card
+// is a genuinely different way to make the trip.
+function renderPlannedJourneyCard(result, kinds = []) {
   const card = document.createElement('div');
   card.className = 'journey-option';
 
-  // Only present for an 'arrive by' query (planJourneyArrivingBy) — shown so a rider can
-  // see at a glance that the actual arrival below is at/before what they asked for, not
-  // just trust it silently (Principle 1: honesty over confidence).
-  if (result.requestedArriveBy) {
-    const requestedLine = document.createElement('div');
-    requestedLine.className = 'journey-option-summary journey-muted';
-    requestedLine.textContent = `Requested: arrive by ${result.requestedArriveBy}`;
-    card.appendChild(requestedLine);
+  if (kinds.length > 0) {
+    const label = document.createElement('div');
+    label.className = 'journey-option-kinds';
+    const vehicles = result.legs.length;
+    const walking = (result.origin?.walkMinutes ?? 0) + (result.destination?.walkMinutes ?? 0);
+    label.textContent = `${kinds.map((k) => OPTION_KIND_LABELS[k] ?? k).join(' · ')}`;
+    const meta = document.createElement('span');
+    meta.className = 'journey-option-kinds-meta';
+    meta.textContent = ` — ${vehicles} ${vehicles === 1 ? 'vehicle' : 'vehicles'}, ${walking} min walking`;
+    label.appendChild(meta);
+    card.appendChild(label);
   }
 
   const originLine = document.createElement('div');
@@ -2553,7 +2561,20 @@ function renderPlannedJourneySection() {
     return;
   }
 
-  journeyResultsEl.appendChild(renderPlannedJourneyCard(plannedJourneyResult));
+  // Only present for an 'arrive by' query — shown so a rider can see at a glance that
+  // each option's arrival is at/before what they asked for, not just trust it silently
+  // (Principle 1: honesty over confidence). Once for the section, not per card.
+  if (plannedJourneyResult.requestedArriveBy) {
+    const requestedLine = document.createElement('div');
+    requestedLine.className = 'journey-option-summary journey-muted';
+    requestedLine.textContent = `Requested: arrive by ${plannedJourneyResult.requestedArriveBy}`;
+    journeyResultsEl.appendChild(requestedLine);
+  }
+
+  // A response without options is from before Fastest/Simplest/Least walking existed —
+  // render it as the single itinerary it is.
+  const options = plannedJourneyResult.options ?? [{ ...plannedJourneyResult, kinds: [] }];
+  options.forEach((option) => journeyResultsEl.appendChild(renderPlannedJourneyCard(option, option.kinds)));
 }
 
 // The decluttered step view for a committed itinerary (see selectedItinerary's header
