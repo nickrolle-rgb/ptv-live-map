@@ -316,6 +316,29 @@ function firstIndexAtOrAfter(connections, t) {
   return lo;
 }
 
+// The next timetabled departures from any of `stopIds`, earliest first, one per trip,
+// within windowSec of fromEpochMs. Used for a stop's popup where the live feed has
+// nothing (PTV's tram feed only reports a few timing-point stops ahead of each tram).
+export function stopDepartures({ schedules, stopIds, fromEpochMs, limit = 5, windowSec = 2 * 3600 }) {
+  const wanted = new Set(stopIds);
+  const { dateStr, seconds } = melbourneDateAndSeconds(fromEpochMs);
+  const connections = getConnections(schedules, dateStr);
+  const out = [];
+  const seenTrips = new Set();
+  for (let i = firstIndexAtOrAfter(connections, seconds); i < connections.length && out.length < limit; i++) {
+    const c = connections[i];
+    if (c.depTime > seconds + windowSec) break;
+    if (!wanted.has(c.fromStopId) || seenTrips.has(c.tripId)) continue;
+    seenTrips.add(c.tripId);
+    out.push({
+      tripId: c.tripId, routeId: c.routeId, mode: c.mode, stopId: c.fromStopId,
+      time: formatTimeOfDay(c.depTime),
+      epochMs: melbourneWallClockToEpochMs(dateStr, c.depTime),
+    });
+  }
+  return out;
+}
+
 // Origin walk -> Map(stopId -> arrival seconds), from a findWalkableStops result.
 function seedArrivals(originWalk, queryAbs) {
   const seeds = new Map();

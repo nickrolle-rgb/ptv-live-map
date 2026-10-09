@@ -847,8 +847,9 @@ function showRouteShape(mode, routeId) {
   // here" indicator, not a reliable proxy for any given vehicle's actual resolved stop
   // (see the note by dwellingRingLayers above); the arriving-vehicle ring is always
   // drawn separately, directly on top.
+  // Tapping one opens buildStopPopup (name, live arrivals, this stop on your journey).
+  const stopLines = MODES[mode]?.stops?.[routeId] || [];
   if (mode !== 'tram') {
-    const stopLines = MODES[mode]?.stops?.[routeId] || [];
     stopLines.forEach((points) => {
       points.forEach(([lat, lon]) => {
         layers.push(L.circleMarker([lat, lon], {
@@ -858,13 +859,150 @@ function showRouteShape(mode, routeId) {
           opacity: 0.9,
           fillColor: pathColor,
           fillOpacity: 0,
-        }));
+          bubblingMouseEvents: false, // a stop tap isn't a map tap (no dropped journey pin)
+        }).bindPopup('').on('popupopen', (e) => e.popup.setContent(buildStopPopup(mode, lat, lon, e.popup))));
       });
     });
+  } else {
+    // Tram stops only once zoomed in to street level, small, where they stop being
+    // clutter and become something worth tapping (see syncTramStopLayers).
+    const dots = [];
+    stopLines.forEach((points) => {
+      points.forEach(([lat, lon]) => {
+        dots.push(L.circleMarker([lat, lon], {
+          radius: 6, color: pathColor, weight: 2, opacity: 0.9, fillColor: '#fff', fillOpacity: 1, bubblingMouseEvents: false,
+        }).bindPopup('').on('popupopen', (e) => e.popup.setContent(buildStopPopup(mode, lat, lon, e.popup))));
+      });
+    });
+    tramStopLayers.set(routeKey, L.layerGroup(dots));
+    syncTramStopLayers();
   }
 
   const group = L.layerGroup(layers).addTo(map);
   routeShapeLayers.set(routeKey, group);
+}
+
+const TRAM_STOPS_MIN_ZOOM = 16;
+const tramStopLayers = new Map(); // routeKey -> L.layerGroup, added to the map only when zoomed in
+
+function syncTramStopLayers() {
+  const show = map.getZoom() >= TRAM_STOPS_MIN_ZOOM;
+  tramStopLayers.forEach((group) => {
+    if (show && !map.hasLayer(group)) group.addTo(map);
+    if (!show && map.hasLayer(group)) map.removeLayer(group);
+  });
+}
+
+// --- Stop popups -------------------------------------------------------------------
+// The drawn stop circles only carry coordinates, so a tap resolves them back to a named
+// stop via stopNames (stopId -> [name, lat, lon]), then gathers every stopId sharing
+// that name nearby — a station's platforms, or a tram stop's two sides of the road.
+const STOP_TAP_MATCH_KM = 0.1;
+const STOP_GROUP_RADIUS_KM = 0.3;
+const MAX_STOP_ARRIVALS = 5;
+
+function resolveStopAt(mode, lat, lon) {
+  const names = MODES[mode]?.stopNames ?? {};
+  let best = null;
+  Object.entries(names).forEach(([stopId, [name, sLat, sLon]]) => {
+    const km = haversineKm(lat, lon, sLat, sLon);
+    if (km <= STOP_TAP_MATCH_KM && (!best || km < best.km)) best = { name, km };
+  });
+  if (!best) return null;
+  const stopIds = new Set();
+  Object.entries(names).forEach(([stopId, [name, sLat, sLon]]) => {
+    if (name === best.name && haversineKm(lat, lon, sLat, sLon) <= STOP_GROUP_RADIUS_KM) stopIds.add(stopId);
+  });
+  return { name: best.name, stopIds };
+}
+
+// Upcoming live arrivals at the stop, from the trip-updates feed. That feed only keeps a
+// few stops ahead of each vehicle, so this is "what's on its way", not a full timetable.
+function liveArrivalsAt(mode, stopIds, nowMs) {
+  const arrivals = [];
+  tripUpdatesByTrip.forEach((update, key) => {
+    if (!key.startsWith(`${mode}:`)) return;
+    const s = (update.stops ?? []).find((st) => stopIds.has(st.stopId));
+    const sec = s?.arrival ?? s?.departure;
+    if (sec == null || sec * 1000 < nowMs - 30000) return;
+    const tripId = key.slice(mode.length + 1);
+    arrivals.push({ epochMs: sec * 1000, routeId: update.routeId, headsign: headsignFor(mode, tripId) });
+  });
+  return arrivals.sort((a, b) => a.epochMs - b.epochMs).slice(0, MAX_STOP_ARRIVALS);
+}
+
+// Where this stop falls on the selected journey, with live delay applied.
+function journeyLinesAt(stop) {
+  const lines = [];
+  const itin = selectedItinerary;
+  if (!itin) return lines;
+  itin.legs.forEach((leg, i) => {
+    const idx = (leg.stops ?? []).findIndex((s) => stop.stopIds.has(s.stopId) || s.name === stop.name);
+    if (idx === -1) return;
+    const delayMs = itineraryTracking?.legs[i]?.delayMs ?? 0;
+    const at = epochMsToHHMM(leg.stops[idx].epochMs + delayMs);
+    const late = Math.round(delayMs / 60000) > 0 ? ` (${delayLabel(delayMs)})` : '';
+    const name = legName(leg);
+    if (idx === 0) lines.push(`Board the ${name} at ${at}${late}`);
+    else if (idx === leg.stops.length - 1) lines.push(`Your ${name} gets here at ${at}${late}${i === itin.legs.length - 1 ? '' : ' — change here'}`);
+    else lines.push(`Your ${name} passes through at ${at}${late}`);
+  });
+  return lines;
+}
+
+// Built as DOM on every open (see the popupopen handlers), so the times are current when
+// tapped. Not a bindPopup content function: popup.update() would re-run that, refetching.
+function buildStopPopup(mode, lat, lon, popup) {
+  const el = document.createElement('div');
+  el.className = 'stop-popup';
+  const stop = resolveStopAt(mode, lat, lon);
+  const heading = document.createElement('strong');
+  heading.textContent = stop?.name ?? `${LEG_MODE_NAMES[mode] ?? mode} stop`;
+  el.appendChild(heading);
+  if (!stop) return el;
+
+  const nowMs = Date.now();
+  const journey = journeyLinesAt(stop);
+  if (journey.length > 0) {
+    const box = document.createElement('div');
+    box.className = 'stop-popup-journey';
+    journey.forEach((text) => {
+      const line = document.createElement('div');
+      line.textContent = text;
+      box.appendChild(line);
+    });
+    el.appendChild(box);
+  }
+
+  const label = document.createElement('div');
+  label.className = 'stop-popup-label';
+  el.appendChild(label);
+  const list = document.createElement('div');
+  el.appendChild(list);
+  const showArrivals = (arrivals) => arrivals.forEach((a) => {
+    const line = document.createElement('div');
+    const to = a.headsign ? ` to ${abbreviateHeadsign(a.headsign)}` : '';
+    line.textContent = `${LEG_MODE_NAMES[mode]} ${routeInfo(mode, a.routeId).name}${to} — ${epochMsToHHMM(a.epochMs)}, ${formatMinutesFromNow((a.epochMs - Date.now()) / 60000)}`;
+    list.appendChild(line);
+  });
+
+  const live = liveArrivalsAt(mode, stop.stopIds, nowMs);
+  if (live.length > 0) {
+    label.textContent = 'Arriving soon (live)';
+    showArrivals(live);
+    return el;
+  }
+  // Nothing live for this stop: fall back to the timetable, said plainly as such.
+  label.textContent = 'Loading timetable…';
+  const params = new URLSearchParams({ mode, stopIds: [...stop.stopIds].join(','), from: nowMs });
+  fetchJson(`/api/stop-departures?${params}`).then((data) => {
+    const departures = (data?.departures ?? []).map((d) => ({ ...d, headsign: headsignFor(mode, d.tripId) }));
+    label.textContent = departures.length > 0 ? 'Timetabled (no live times for this stop)' : 'No departures in the next 2 hours';
+    showArrivals(departures);
+  }).catch(() => {
+    label.textContent = 'No live times for this stop';
+  }).finally(() => popup.update()); // re-fit the popup to its new size
+  return el;
 }
 
 function hideRouteShape(mode, routeId) {
@@ -873,6 +1011,11 @@ function hideRouteShape(mode, routeId) {
   if (group) {
     map.removeLayer(group);
     routeShapeLayers.delete(routeKey);
+  }
+  const tramStops = tramStopLayers.get(routeKey);
+  if (tramStops) {
+    map.removeLayer(tramStops);
+    tramStopLayers.delete(routeKey);
   }
 }
 
@@ -896,6 +1039,7 @@ function updateDwellingRings(dwellingStops) {
         weight: 2.5,
         fillColor: '#fff',
         fillOpacity: 1,
+        interactive: false, // let a tap fall through to the stop circle beneath (its popup)
       }).addTo(map);
       dwellingRingLayers.set(key, ring);
     }
@@ -3359,6 +3503,7 @@ const RecenterControl = L.Control.extend({
 });
 new RecenterControl().addTo(map);
 map.on('dragstart', () => { if (followMode) setFollowMode(null); });
+map.on('zoomend', syncTramStopLayers);
 
 function centerOnUser() {
   if (!navigator.geolocation) {

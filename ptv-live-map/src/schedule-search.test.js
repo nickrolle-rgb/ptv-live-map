@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { melbourneDateAndSeconds, melbourneWallClockToEpochMs, planJourney, planJourneyArrivingBy, planJourneyOptions } from './schedule-search.js';
+import { melbourneDateAndSeconds, melbourneWallClockToEpochMs, planJourney, planJourneyArrivingBy, planJourneyOptions, stopDepartures } from './schedule-search.js';
 
 // ---------------------------------------------------------------------------
 // melbourneDateAndSeconds — DST boundary tests.
@@ -723,5 +723,21 @@ describe('planJourneyArrivingBy', () => {
       // the target's own calendar day), so comparing as minutes-of-day is safe here.
       expect(parseHHMM(result.arriveBy)).toBeLessThanOrEqual(parseHHMM(result.requestedArriveBy));
     });
+  });
+});
+
+describe('stopDepartures', () => {
+  it('lists the next departures from any of a stop\'s ids, earliest first, with epoch times', () => {
+    const schedules = [{ mode: 'tram', data: baseScheduleData() }];
+    const result = stopDepartures({ schedules, stopIds: ['S1', 'S2B'], fromEpochMs: QUERY_BEFORE_0800 });
+    expect(result.map((d) => [d.tripId, d.stopId, d.time])).toEqual([['T1', 'S1', '08:00'], ['T2', 'S2B', '08:15']]);
+    expect(result[0].epochMs).toBe(Date.UTC(2026, 7, 4, 22, 0, 0));
+  });
+
+  it('skips departures already gone and ones past the window', () => {
+    const schedules = [{ mode: 'tram', data: baseScheduleData() }];
+    const at0805 = QUERY_BEFORE_0800 + 20 * 60 * 1000;
+    expect(stopDepartures({ schedules, stopIds: ['S1', 'S2B'], fromEpochMs: at0805 }).map((d) => d.tripId)).toEqual(['T2']);
+    expect(stopDepartures({ schedules, stopIds: ['S2B'], fromEpochMs: QUERY_BEFORE_0800, windowSec: 600 })).toEqual([]);
   });
 });
