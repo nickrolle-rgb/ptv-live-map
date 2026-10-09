@@ -3016,6 +3016,75 @@ function updateRideDetection(userFixPrev, userFixNext) {
   }
 }
 
+// --- Recentre / follow ---------------------------------------------------------------
+// The map only centres on the user once, on the first GPS fix (see centerOnUser) — after
+// that the dot keeps moving but the view stays wherever the rider last panned, which
+// reads as "lost GPS" once the dot drifts off-screen. The recentre button (under the
+// zoom controls) snaps back and then keeps following until the rider drags the map:
+// onto the confirmed-ride vehicle if there is one (see confirmedRide), otherwise onto
+// the user. Zooming doesn't stop following; only a drag does, since that's the rider
+// deliberately looking somewhere else.
+let followMode = null; // 'user' | 'vehicle' | null
+let followTimer = null;
+let recenterButton = null;
+const FOLLOW_VEHICLE_INTERVAL_MS = 1000;
+const RECENTER_MIN_ZOOM = 15;
+
+function followedVehicleLatLng() {
+  if (!confirmedRide) return null;
+  const marker = markers.get(confirmedRide.vehicleKey);
+  return marker ? marker.getLatLng() : null;
+}
+
+function setFollowMode(mode) {
+  followMode = mode;
+  clearInterval(followTimer);
+  followTimer = null;
+  if (mode === 'vehicle') {
+    // Vehicle markers animate between feed updates, so this pans on a short interval
+    // rather than per feed refresh. Falls back to following the user if the ride ends or
+    // its marker disappears (e.g. the vehicle stops reporting).
+    followTimer = setInterval(() => {
+      const latLng = followedVehicleLatLng();
+      if (latLng) map.panTo(latLng, { animate: true, duration: 0.8 });
+      else setFollowMode(userLocation ? 'user' : null);
+    }, FOLLOW_VEHICLE_INTERVAL_MS);
+  }
+  if (recenterButton) {
+    recenterButton.classList.toggle('following', Boolean(mode));
+    recenterButton.title = mode === 'vehicle' ? 'Following your vehicle' : mode === 'user' ? 'Following your location' : 'Centre on me';
+  }
+}
+
+function recenter() {
+  const vehicle = followedVehicleLatLng();
+  const target = vehicle ?? (userLocation ? L.latLng(userLocation.lat, userLocation.lon) : null);
+  if (!target) return; // no GPS fix yet and no confirmed ride — nothing to centre on
+  map.setView(target, Math.max(map.getZoom(), RECENTER_MIN_ZOOM));
+  setFollowMode(vehicle ? 'vehicle' : 'user');
+}
+
+const RecenterControl = L.Control.extend({
+  options: { position: 'topleft' },
+  onAdd() {
+    const bar = L.DomUtil.create('div', 'leaflet-bar recenter-control');
+    const button = L.DomUtil.create('a', 'recenter-button', bar);
+    button.href = '#';
+    button.setAttribute('role', 'button');
+    button.setAttribute('aria-label', 'Centre on me');
+    button.title = 'Centre on me';
+    button.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" fill="currentColor"/><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 1v4M12 19v4M1 12h4M19 12h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+    // Without this the tap would also reach the map — dropping a journey pin when the
+    // Journey pane is open.
+    L.DomEvent.disableClickPropagation(bar);
+    L.DomEvent.on(button, 'click', (e) => { L.DomEvent.preventDefault(e); recenter(); });
+    recenterButton = button;
+    return bar;
+  },
+});
+new RecenterControl().addTo(map);
+map.on('dragstart', () => { if (followMode) setFollowMode(null); });
+
 function centerOnUser() {
   if (!navigator.geolocation) {
     mapSettled = true;
@@ -3041,6 +3110,7 @@ function centerOnUser() {
         mapSettled = true;
         checkInitialLoadDone();
       }
+      if (followMode === 'user') map.panTo([userLocation.lat, userLocation.lon]);
       if (userLocationMarker) {
         userLocationMarker.setLatLng([userLocation.lat, userLocation.lon]);
       } else {
