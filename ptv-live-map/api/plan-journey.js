@@ -28,7 +28,10 @@ import { planJourneyOptions, planJourneyOptionsArrivingBy } from '../src/schedul
 // schedule-search.js's buildInterchangeGroups for why that's fine: interchanges are
 // resolved by physical proximity, not by stop_id or name matching, specifically so tram
 // can be spread in here safely without needing a shared id space of its own.
-const stopRegistry = { ...trainStopNames, ...vlineStopNames, ...tramStopNames };
+// V/Line first so train's entries win for shared stations: V/Line's copy of the same
+// stop_id carries no platform, and spreading it last wiped every shared station's
+// platform (Southern Cross, Flinders Street...) out of planned itineraries.
+const stopRegistry = { ...vlineStopNames, ...trainStopNames, ...tramStopNames };
 const schedules = [
   { mode: 'train', data: trainSchedule },
   { mode: 'vline', data: vlineSchedule },

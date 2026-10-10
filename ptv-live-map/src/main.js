@@ -918,6 +918,11 @@ function resolveStopAt(mode, lat, lon) {
 
 // Upcoming live arrivals at the stop, from the trip-updates feed. That feed only keeps a
 // few stops ahead of each vehicle, so this is "what's on its way", not a full timetable.
+// Platform number for a platform-level stop_id (train only; null elsewhere).
+function platformOf(mode, stopId) {
+  return MODES[mode]?.stopNames?.[stopId]?.[3] ?? null;
+}
+
 function liveArrivalsAt(mode, stopIds, nowMs) {
   const arrivals = [];
   tripUpdatesByTrip.forEach((update, key) => {
@@ -926,7 +931,7 @@ function liveArrivalsAt(mode, stopIds, nowMs) {
     const sec = s?.arrival ?? s?.departure;
     if (sec == null || sec * 1000 < nowMs - 30000) return;
     const tripId = key.slice(mode.length + 1);
-    arrivals.push({ epochMs: sec * 1000, routeId: update.routeId, headsign: headsignFor(mode, tripId) });
+    arrivals.push({ epochMs: sec * 1000, routeId: update.routeId, stopId: s.stopId, headsign: headsignFor(mode, tripId) });
   });
   return arrivals.sort((a, b) => a.epochMs - b.epochMs).slice(0, MAX_STOP_ARRIVALS);
 }
@@ -941,11 +946,13 @@ function journeyLinesAt(stop) {
     if (idx === -1) return;
     const delayMs = itineraryTracking?.legs[i]?.delayMs ?? 0;
     const at = epochMsToHHMM(leg.stops[idx].epochMs + delayMs);
+    const plat = platformOf(leg.mode, leg.stops[idx].stopId);
+    const where = plat ? `, Plat ${plat}` : '';
     const late = Math.round(delayMs / 60000) > 0 ? ` (${delayLabel(delayMs)})` : '';
     const name = legName(leg);
-    if (idx === 0) lines.push(`Board the ${name} at ${at}${late}`);
-    else if (idx === leg.stops.length - 1) lines.push(`Your ${name} gets here at ${at}${late}${i === itin.legs.length - 1 ? '' : ' — change here'}`);
-    else lines.push(`Your ${name} passes through at ${at}${late}`);
+    if (idx === 0) lines.push(`Board the ${name} at ${at}${where}${late}`);
+    else if (idx === leg.stops.length - 1) lines.push(`Your ${name} gets here at ${at}${where}${late}${i === itin.legs.length - 1 ? '' : ' — change here'}`);
+    else lines.push(`Your ${name} passes through at ${at}${where}${late}`);
   });
   return lines;
 }
@@ -982,7 +989,8 @@ function buildStopPopup(mode, lat, lon, popup) {
   const showArrivals = (arrivals) => arrivals.forEach((a) => {
     const line = document.createElement('div');
     const to = a.headsign ? ` to ${abbreviateHeadsign(a.headsign)}` : '';
-    line.textContent = `${LEG_MODE_NAMES[mode]} ${routeInfo(mode, a.routeId).name}${to} — ${epochMsToHHMM(a.epochMs)}, ${formatMinutesFromNow((a.epochMs - Date.now()) / 60000)}`;
+    const plat = platformOf(mode, a.stopId);
+    line.textContent = `${LEG_MODE_NAMES[mode]} ${routeInfo(mode, a.routeId).name}${to}${plat ? ` · Plat ${plat}` : ''} — ${epochMsToHHMM(a.epochMs)}, ${formatMinutesFromNow((a.epochMs - Date.now()) / 60000)}`;
     list.appendChild(line);
   });
 
